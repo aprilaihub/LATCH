@@ -1,0 +1,151 @@
+{
+  "budget": {
+    "max_heavy_calls": 8,
+    "max_light_mutation_calls": 8,
+    "max_llm_calls": 1,
+    "max_outer_attempts": 8,
+    "max_read_calls": 8,
+    "max_usd": null,
+    "max_validation_calls": 8,
+    "unknown_pricing_policy": "allow_not_run",
+    "whole_run_wall_time_seconds": 60.0
+  },
+  "catalogue": {
+    "capability_hash": "9650d5730f37dd1b4c4483e2eb4ff3a494a2bf1a0fb579a2df71ab6e1f754391",
+    "capability_version": "dof.level-capability.v1",
+    "catalogue_hash": "8307e022658776b3a15f143c679e4c3150c65c9246ec90c8703e5a68cb51f581",
+    "catalogue_version": "dof.strict-manual-primitives.v1"
+  },
+  "condition_id": "l3-forbidden-flow",
+  "experiment_id": "wp002-common-contract",
+  "interface": {
+    "action_schema_hash": "f2e4ae300f8780c03f1e7ba5c0d4ba5542e57f6cc90e52037bff08e7fece620c",
+    "action_schema_version": "dof.action-interface-schema.v2",
+    "context_hash": "54252b1e90ab19fc024ac47b2b9ece9e99467b2e979b6a5139fd53ea2c6942af",
+    "context_version": "dof.context-interface-schema.v2",
+    "prompt_hash": "362a60e6442b735d85ebd3e07181f877f3242602dee3893011bfd23794409d6c",
+    "prompt_version": "dof.l3-prompt.v1"
+  },
+  "level": "L3",
+  "mask": {
+    "forbidden_sentinels": [],
+    "hash": "afe610e0d5a1b2e267f80c98c35fd235cbe8be73b144f913c889fdd41a37811c",
+    "hidden_macro_families": [],
+    "known_prior_allowlist": [],
+    "version": "dof.mask.none.v1"
+  },
+  "mock_observation": {
+    "budget_remaining": {
+      "IMPLEMENTATION_HEAVY": 8,
+      "LLM_REQUEST": 1,
+      "MUTATION_LIGHT": 8,
+      "OUTER_ATTEMPT": 8,
+      "READ_ONLY": 8,
+      "VALIDATION": 8,
+      "WALL_TIME_SECONDS": 60.0
+    },
+    "condition": {
+      "pseudonym": "condition-mock"
+    },
+    "history": [],
+    "known_priors": {},
+    "state": {
+      "lineage_pseudonym": "lineage-root",
+      "measurements": {
+        "congestion": {
+          "hotspots": 0,
+          "level": "low"
+        },
+        "placement": {
+          "placed_cells": 100,
+          "status": "placed",
+          "unplaced_cells": 0
+        },
+        "route": {
+          "status": "routed",
+          "unrouted_nets": 0
+        },
+        "timing": {
+          "clock_period_ns": 2.5,
+          "estimated_fmax_mhz": 380.0,
+          "failing_endpoints": 2,
+          "tns_ns": -1.0,
+          "wns_ns": -0.2
+        },
+        "utilization": {
+          "bram": 2,
+          "dsp": 4,
+          "ff": 200,
+          "lut": 100
+        }
+      },
+      "pseudonym": "state-root",
+      "stage": "ROUTED"
+    },
+    "stop_conditions": [
+      "declared budget exhausted"
+    ],
+    "validation": {
+      "errors": [],
+      "status": "CLEAN",
+      "warnings": []
+    }
+  },
+  "model": {
+    "adapter_version": "adapter.v1",
+    "decision_adapter": "mock_json_adapter",
+    "model_id": "deterministic-mock",
+    "model_version": "mock.v1",
+    "provider": "mock",
+    "provider_role": "mock_policy"
+  },
+  "policy": {
+    "config_hash": "396287ba5654648e9906e0b293b36c72cc25432fcfd48113e77598f6d452eb32",
+    "mock_response": {
+      "kind": "ACTION",
+      "steps": [
+        {
+          "action_key": "flow.retime",
+          "parameters": {}
+        }
+      ]
+    },
+    "mode": "mock_adapter",
+    "version": "dof.mock-policy.v1"
+  },
+  "provenance": {
+    "environment_manifest_hash": "3140978dc89311b19db5a99f9abd20b21e9a465602f8567c28aa00eaa57e575c",
+    "environment_manifest_version": "dof.mock-environment.v1",
+    "execution_mode": "mock",
+    "repository_constraint": {
+      "repository_mode": "git",
+      "required_head": null,
+      "require_tracked_clean": true,
+      "untracked_policy": "record_only"
+    },
+    "tool_versions": [
+      {
+        "name": "rapidwright",
+        "version": "NOT_RUN"
+      },
+      {
+        "name": "vivado",
+        "version": "NOT_RUN"
+      }
+    ]
+  },
+  "repeat_id": "repeat-000",
+  "root_dcp": {
+    "internal_ref": "mock_root.mockdcp",
+    "model_pseudonym": "design-mock-001",
+    "sha256": "d18f08f7aa32a6421727ce1ef38a70be59040f532471b1aca61a815767de83de"
+  },
+  "schema_version": "dof.experiment-spec.v2",
+  "unknown_regime": "known",
+  "validation": {
+    "scoring_id": "mock-fmax",
+    "scoring_version": "score.v1",
+    "validation_id": "mock-certification",
+    "validation_version": "validation.v1"
+  }
+}

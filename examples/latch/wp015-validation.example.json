@@ -1,0 +1,11 @@
+{
+  "target_clock": "clk_fpl26contest",
+  "seeds": [12648430, 1592594996, 464367618, 219540062, 168939093],
+  "vectors": 200,
+  "precheck_vectors": 100,
+  "epsilon_fmax": 0,
+  "prepare_timeout_seconds": 10800,
+  "seed_timeout_seconds": 3600,
+  "score_timeout_seconds": 900,
+  "memory_reserve_fraction": 0.2
+}

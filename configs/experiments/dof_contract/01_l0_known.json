@@ -1,0 +1,143 @@
+{
+  "budget": {
+    "max_heavy_calls": 0,
+    "max_light_mutation_calls": 0,
+    "max_llm_calls": 0,
+    "max_outer_attempts": 0,
+    "max_read_calls": 8,
+    "max_usd": null,
+    "max_validation_calls": 8,
+    "unknown_pricing_policy": "allow_not_run",
+    "whole_run_wall_time_seconds": 60.0
+  },
+  "catalogue": {
+    "capability_hash": "c6fe9b31b78af87f1ed42a80667e639ff83de3edabdc09bc96bde5c3b9db182c",
+    "capability_version": "dof.level-capability.v1",
+    "catalogue_hash": "569fc502f6c13861d2f4eeb8bd52c09845f888740a51db6af7940106516644d9",
+    "catalogue_version": "dof.no-actions.v1"
+  },
+  "condition_id": "l0-known",
+  "experiment_id": "wp002-common-contract",
+  "interface": {
+    "action_schema_hash": "NOT_RUN",
+    "action_schema_version": "NOT_RUN",
+    "context_hash": "NOT_RUN",
+    "context_version": "NOT_RUN",
+    "prompt_hash": "NOT_RUN",
+    "prompt_version": "NOT_RUN"
+  },
+  "level": "L0",
+  "mask": {
+    "forbidden_sentinels": [],
+    "hash": "afe610e0d5a1b2e267f80c98c35fd235cbe8be73b144f913c889fdd41a37811c",
+    "hidden_macro_families": [],
+    "known_prior_allowlist": [],
+    "version": "dof.mask.none.v1"
+  },
+  "mock_observation": {
+    "budget_remaining": {
+      "IMPLEMENTATION_HEAVY": 8,
+      "LLM_REQUEST": 1,
+      "MUTATION_LIGHT": 8,
+      "OUTER_ATTEMPT": 8,
+      "READ_ONLY": 8,
+      "VALIDATION": 8,
+      "WALL_TIME_SECONDS": 60.0
+    },
+    "condition": {
+      "pseudonym": "condition-mock"
+    },
+    "history": [],
+    "known_priors": {},
+    "state": {
+      "lineage_pseudonym": "lineage-root",
+      "measurements": {
+        "congestion": {
+          "hotspots": 0,
+          "level": "low"
+        },
+        "placement": {
+          "placed_cells": 100,
+          "status": "placed",
+          "unplaced_cells": 0
+        },
+        "route": {
+          "status": "routed",
+          "unrouted_nets": 0
+        },
+        "timing": {
+          "clock_period_ns": 2.5,
+          "estimated_fmax_mhz": 380.0,
+          "failing_endpoints": 2,
+          "tns_ns": -1.0,
+          "wns_ns": -0.2
+        },
+        "utilization": {
+          "bram": 2,
+          "dsp": 4,
+          "ff": 200,
+          "lut": 100
+        }
+      },
+      "pseudonym": "state-root",
+      "stage": "ROUTED"
+    },
+    "stop_conditions": [
+      "declared budget exhausted"
+    ],
+    "validation": {
+      "errors": [],
+      "status": "CLEAN",
+      "warnings": []
+    }
+  },
+  "model": {
+    "adapter_version": "NOT_RUN",
+    "decision_adapter": "none",
+    "model_id": "none",
+    "model_version": "NOT_RUN",
+    "provider": "none",
+    "provider_role": "none"
+  },
+  "policy": {
+    "config_hash": "2e92ff5bf5370554d2025d75ad1e3440f8b5a7097582cc3df31272a20e940381",
+    "mock_response": {},
+    "mode": "baseline",
+    "version": "dof.mock-policy.v1"
+  },
+  "provenance": {
+    "environment_manifest_hash": "3140978dc89311b19db5a99f9abd20b21e9a465602f8567c28aa00eaa57e575c",
+    "environment_manifest_version": "dof.mock-environment.v1",
+    "execution_mode": "mock",
+    "repository_constraint": {
+      "repository_mode": "git",
+      "required_head": null,
+      "require_tracked_clean": true,
+      "untracked_policy": "record_only"
+    },
+    "tool_versions": [
+      {
+        "name": "rapidwright",
+        "version": "NOT_RUN"
+      },
+      {
+        "name": "vivado",
+        "version": "NOT_RUN"
+      }
+    ]
+  },
+  "repeat_id": "repeat-000",
+  "root_dcp": {
+    "internal_ref": "mock_root.mockdcp",
+    "model_pseudonym": "design-mock-001",
+    "sha256": "d18f08f7aa32a6421727ce1ef38a70be59040f532471b1aca61a815767de83de"
+  },
+  "schema_version": "dof.experiment-spec.v2",
+  "unknown_regime": "known",
+  "validation": {
+    "scoring_id": "mock-fmax",
+    "scoring_version": "score.v1",
+    "validation_id": "mock-certification",
+    "validation_version": "validation.v1"
+  }
+}

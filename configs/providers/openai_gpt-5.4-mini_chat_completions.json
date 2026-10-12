@@ -1,0 +1,42 @@
+{
+  "schema_version": "dof.provider-model-request-capability.v1",
+  "profile_version": "dof.openai.gpt-5.4-mini.chat-completions.v1",
+  "provider": "openai",
+  "adapter_type": "openai",
+  "adapter_version": "dof.openai-chat-completions-transport.v2",
+  "model_id": "gpt-5.4-mini",
+  "model_revision_policy": "exact_model_id_provider_revision_optional",
+  "sdk_operation": "chat.completions.create",
+  "sdk_operation_version": "dof.openai.chat-completions-create.v1",
+  "token_limit_parameter": "max_completion_tokens",
+  "response_format": {
+    "policy": "include",
+    "value": {
+      "type": "json_object"
+    }
+  },
+  "temperature_policy": "omit",
+  "seed_policy": "omit",
+  "timeout": {
+    "placement": "client",
+    "parameter": "timeout"
+  },
+  "client_retry_policy": {
+    "max_retries": 0
+  },
+  "http_transport_policy": {
+    "implementation": "openai.DefaultAsyncHttpxClient",
+    "follow_redirects": false,
+    "trust_env": false,
+    "http2": false,
+    "request_counter": "httpx.async-request-event-hook.v1",
+    "cleanup_deadline_policy": "single-nonrenewable-deadline.v1",
+    "cleanup_reserve_seconds": 1.0
+  },
+  "disallowed_simultaneous_fields": [
+    [
+      "max_tokens",
+      "max_completion_tokens"
+    ]
+  ]
+}

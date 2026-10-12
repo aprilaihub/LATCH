@@ -1,0 +1,16 @@
+{
+  "schema_version": "dof.wp015a-provider-output-envelope.v1",
+  "common_final_answer_capacity_tokens": 4096,
+  "hard_total_generated_token_ceiling": 12288,
+  "accepted_finish_reasons_exclude": ["length", "max_tokens", "MAX_TOKENS"],
+  "profiles": {
+    "openai": {"request_field": "max_completion_tokens", "value": 12288, "reasoning": "high", "separate_final_reservation_exposed": false},
+    "anthropic": {"request_field": "max_tokens", "value": 12288, "reasoning": "adaptive/high", "separate_final_reservation_exposed": false},
+    "deepseek": {"request_field": "max_tokens", "value": 12288, "reasoning": "enabled", "separate_final_reservation_exposed": false},
+    "google_gemini": {"request_field": "generationConfig.maxOutputTokens", "value": 12288, "reasoning": "HIGH", "separate_final_reservation_exposed": false}
+  },
+  "acceptance_firewall": "final_text_present AND NOT final_text_truncated AND NOT silent_truncation_detected",
+  "retry_count": 0,
+  "fallback_count": 0,
+  "response_repair_count": 0
+}

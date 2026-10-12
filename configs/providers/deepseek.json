@@ -1,0 +1,11 @@
+{
+  "provider": "deepseek",
+  "adapter_type": "openai_compatible",
+  "base_url": "https://api.deepseek.com",
+  "api_key_env": "DEEPSEEK_API_KEY",
+  "supports_json_object": true,
+  "response_format_policy": "json_object",
+  "temperature_policy": "pass_through",
+  "max_tokens_param": "max_tokens",
+  "pricing_profile": null
+}

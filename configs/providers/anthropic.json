@@ -1,0 +1,12 @@
+{
+  "provider": "anthropic",
+  "adapter_type": "anthropic_native",
+  "base_url": "https://api.anthropic.com/v1/",
+  "api_key_env": "ANTHROPIC_API_KEY",
+  "supports_json_object": false,
+  "response_format_policy": "omit",
+  "temperature_policy": "pass_through",
+  "max_tokens_param": "max_tokens",
+  "_source": "https://platform.claude.com/docs/en/api/openai-sdk -- OpenAI-compatible chat/completions layer over the native Messages API, verified 2026-08-07. response_format_policy set conservatively to omit (not verified whether json_object mode is supported by this compat layer) -- recommend a live test call before trusting for real runs; the closed-loop system prompt already instructs the model to return raw JSON regardless.",
+  "_usage_note": "Native SDK: the OpenAI-compatible shim reports null prompt_tokens_details (anthropic) / completion_tokens=0 with thoughts hidden (google), both of which are billable. Cost via litellm's cache-aware price table."
+}

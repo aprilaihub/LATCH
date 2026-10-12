@@ -1,0 +1,18 @@
+{
+  "policy_type": "retrieval",
+  "online_deep_analysis": true,
+  "analysis_only": false,
+  "analysis_level": "report_probe",
+  "analysis_report_probe_backend": "local_vivado",
+  "analysis_tool_loop_mode": "mock_llm_closed_loop",
+  "analysis_tool_timeout_sec": 300.0,
+  "analysis_root_budget_sec": 600.0,
+  "analysis_state_budget_sec": 120.0,
+  "analysis_max_states_per_expansion": 1,
+  "analysis_allow_report_probes": true,
+  "analysis_allow_act_probes": false,
+  "analysis_tool_plan_policy": "static_root_timing_route_v1",
+  "q_weight_runtime_minutes": 0.0,
+  "llm_context_mode": "retrieval",
+  "model": null
+}

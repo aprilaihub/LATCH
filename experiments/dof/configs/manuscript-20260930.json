@@ -1,0 +1,33 @@
+{
+  "source_note": "2026-09-30 compact figure source: 16 designs, seven models, three conditioned interfaces. Curated input required; not a raw collector manifest.",
+  "designs": [
+    "amd_mini-isp",
+    "boom_soc",
+    "corescore_500_mod",
+    "finn_radioml",
+    "fir_systolic_transposed_routed",
+    "logicnets_jscl",
+    "rapidwright_picoblazearray",
+    "rosetta_digit-recognition",
+    "rosetta_optical-flow",
+    "transfer_amd_mini_isp_v2",
+    "transfer_boom_soc_v2",
+    "transfer_fir_symmetric",
+    "transfer_rosetta_3d_v2",
+    "transfer_vtr_mcml_v2",
+    "vexriscv_re-place",
+    "vexriscv_re-place_v2"
+  ],
+  "models": [
+    "anthropic/claude-sonnet-5",
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro",
+    "google/gemini-3.6-flash",
+    "openai/gpt-5.6-luna",
+    "openai/gpt-5.6-sol",
+    "openai/gpt-5.6-terra"
+  ],
+  "repeat_ids": [
+    "R1_LEAN_PRIMARY"
+  ]
+}

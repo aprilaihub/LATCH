@@ -1,0 +1,17 @@
+{
+  "policy_type": "retrieval",
+  "online_deep_analysis": true,
+  "analysis_only": true,
+  "analysis_level": "report_probe",
+  "analysis_report_probe_backend": "local_vivado",
+  "analysis_tool_loop_mode": "openai_llm_closed_loop",
+  "analysis_tool_timeout_sec": 300.0,
+  "analysis_root_budget_sec": 600.0,
+  "analysis_max_states_per_expansion": 1,
+  "analysis_allow_report_probes": true,
+  "analysis_allow_act_probes": false,
+  "max_total_runs": 0,
+  "retrieval_k": 5,
+  "q_weight_runtime_minutes": 0.0,
+  "note": "Requires OPENAI_API_KEY and should be run analysis-only first. The LLM can only choose allowlisted read-only/report-probe tools or stop."
+}

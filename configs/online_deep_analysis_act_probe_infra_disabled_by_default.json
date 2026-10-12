@@ -1,0 +1,15 @@
+{
+  "description": "Documentation config showing act-probe infra knobs. Keep analysis_allow_act_probes=false for main experiments unless explicitly studying act-probe analysis.",
+  "online_deep_analysis": true,
+  "analysis_level": "report_probe",
+  "analysis_root_budget_sec": 600,
+  "analysis_state_budget_sec": 120,
+  "analysis_max_states_per_expansion": 5,
+  "analysis_allow_report_probes": true,
+  "analysis_allow_act_probes": false,
+  "q_weight_runtime_minutes": 0.0,
+  "analysis_report_probe_backend": "cached",
+  "analysis_tool_timeout_sec": 300.0,
+  "analysis_tool_plan_policy": "static_root_timing_route_v1",
+  "analysis_tool_loop_mode": "static_plan"
+}

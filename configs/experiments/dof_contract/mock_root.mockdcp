@@ -1,0 +1,2 @@
+WP-002 deterministic mock checkpoint fixture.
+This is deliberately not a Vivado DCP and must never reach a real backend.

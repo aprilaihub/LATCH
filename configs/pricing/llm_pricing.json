@@ -1,0 +1,62 @@
+{
+  "unit-test": {
+    "id": "unit-test",
+    "prompt_usd_per_million_tokens": 1.0,
+    "completion_usd_per_million_tokens": 2.0
+  },
+  "mock": {
+    "id": "mock",
+    "prompt_usd_per_million_tokens": 0.0,
+    "completion_usd_per_million_tokens": 0.0
+  },
+  "mock:mock_good": {
+    "id": "mock:mock_good",
+    "prompt_usd_per_million_tokens": 0.0,
+    "completion_usd_per_million_tokens": 0.0
+  },
+  "mock:mock_noisy": {
+    "id": "mock:mock_noisy",
+    "prompt_usd_per_million_tokens": 0.0,
+    "completion_usd_per_million_tokens": 0.0
+  },
+  "openrouter:openai/gpt-5.4-mini": {
+    "id": "openrouter:openai/gpt-5.4-mini",
+    "prompt_usd_per_million_tokens": 0.75,
+    "completion_usd_per_million_tokens": 4.5
+  },
+  "openrouter:openai/gpt-5.5": {
+    "id": "openrouter:openai/gpt-5.5",
+    "prompt_usd_per_million_tokens": 5.0,
+    "completion_usd_per_million_tokens": 30.0
+  },
+  "openrouter:qwen/qwen-2.5-7b-instruct": {
+    "id": "openrouter:qwen/qwen-2.5-7b-instruct",
+    "prompt_usd_per_million_tokens": 0.04,
+    "completion_usd_per_million_tokens": 0.1,
+    "_source": "https://openrouter.ai/api/v1/models, checked 2026-07-02"
+  },
+  "openrouter:qwen/qwen3-235b-a22b-2507": {
+    "id": "openrouter:qwen/qwen3-235b-a22b-2507",
+    "prompt_usd_per_million_tokens": 0.09,
+    "completion_usd_per_million_tokens": 0.1,
+    "_source": "https://openrouter.ai/api/v1/models, checked 2026-07-02"
+  },
+  "openrouter:deepseek/deepseek-v4-flash": {
+    "id": "openrouter:deepseek/deepseek-v4-flash",
+    "prompt_usd_per_million_tokens": 0.089,
+    "completion_usd_per_million_tokens": 0.18,
+    "_source": "https://openrouter.ai/api/v1/models, checked 2026-07-02"
+  },
+  "openrouter:z-ai/glm-4.7-flash": {
+    "id": "openrouter:z-ai/glm-4.7-flash",
+    "prompt_usd_per_million_tokens": 0.06,
+    "completion_usd_per_million_tokens": 0.4,
+    "_source": "https://openrouter.ai/api/v1/models, checked 2026-07-02"
+  },
+  "openai:gpt-5.4-mini": {
+    "id": "openai:gpt-5.4-mini",
+    "prompt_usd_per_million_tokens": 0.75,
+    "completion_usd_per_million_tokens": 4.5,
+    "_source": "https://developers.openai.com/api/docs/pricing (standard tier, confirmed 2026-07-01 via WebFetch of OpenAI's own pricing page; not reused from the openrouter:openai/gpt-5.4-mini entry above -- independently verified to be the same rate, OpenRouter appears to pass this model through at cost)"
+  }
+}

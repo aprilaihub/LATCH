@@ -1,0 +1,23 @@
+{
+  "max_depth": 2,
+  "branching_factor": 3,
+  "beam_width": 2,
+  "max_total_runs": 6,
+  "max_parallel_jobs": 2,
+  "batch_size": 2,
+  "scheduler_mode": "async",
+  "policy_type": "deterministic",
+  "validation_mode": "log_aware",
+  "online_deep_analysis": true,
+  "analysis_level": "report_probe",
+  "analysis_root_budget_sec": 600,
+  "analysis_state_budget_sec": 120,
+  "analysis_max_states_per_expansion": 2,
+  "analysis_allow_report_probes": true,
+  "analysis_allow_act_probes": false,
+  "q_weight_runtime_minutes": 0.0,
+  "analysis_report_probe_backend": "cached",
+  "analysis_tool_timeout_sec": 300.0,
+  "analysis_tool_plan_policy": "static_root_timing_route_v1",
+  "analysis_tool_loop_mode": "static_plan"
+}

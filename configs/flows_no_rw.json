@@ -1,0 +1,13 @@
+{
+  "allowed_flows": [
+    "phys_opt",
+    "auto_pblock",
+    "lut_cone",
+    "retime",
+    "congestion_spread",
+    "memory_path_opt",
+    "hardblock_relocate",
+    "net_swap"
+  ],
+  "fallback_flow": "phys_opt"
+}

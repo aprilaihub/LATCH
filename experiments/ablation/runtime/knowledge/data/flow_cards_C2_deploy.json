@@ -1,0 +1,133 @@
+{
+  "schema_version": "flow_cards_c2_deploy.v1",
+  "note": "Generalised deploy manual: one card per selectable flow. No benchmark_history side -- guidance is design-agnostic and must not encode per-benchmark results.",
+  "flow_cards": {
+    "auto_pblock": {
+      "id": "auto_pblock",
+      "display_name": "Fabric-aware pblock (spread analysis)",
+      "description": "Measures per-path max Manhattan distance between consecutive placed cells over the 50 worst paths, sizes a region for 1.5x the design's used LUT/FF/DSP/BRAM counts, picks the best contiguous fabric region avoiding delay-heavy columns, then unplaces the ENTIRE design, applies the region as a HARD pblock over the whole design, and re-places and re-routes from scratch.",
+      "use_when": [
+        "critical-path spread is measurably large: the flow's own analysis labels average max consecutive-cell distance above 30 tiles as pblock-recommended, so states well above that line are the mechanism's actual target",
+        "the incumbent placement is disposable: because the flow starts from a full unplace, it is the right move when the current placement is believed bad and the wrong move when it embodies previously banked gains",
+        "utilization is low relative to the device: region targets are 1.5x used resources, so ample headroom lets the fabric search find a compact feasible region with margin"
+      ],
+      "avoid_when": [
+        "reapplying to a state this flow already produced: the mechanism unconditionally discards all placement (including its own previous result) and re-runs the placer -- there is no incremental mode, so a second application is a fresh placer run minus the already-banked win",
+        "high utilization or a resource mix dominated by column-bound hard blocks: a hard (non-soft) pblock sized at 1.5x must still contain enough BRAM/DSP columns, and tight fits recreate congestion inside the region",
+        "assuming the flow self-gates: the greater-than-30-tiles recommendation does NOT gate execution -- the flow proceeds to unplace even when its own analysis prints 'may not help', and if region analysis fails it still unplaces and re-places with no pblock at all (a plain full re-place); the caller must apply the spread check itself"
+      ],
+      "ceiling_note": "The only live flow that re-runs global placement, so it has the largest reachable state change of any flow in either direction; every other live flow is a bounded set of physical-optimization moves on failing paths."
+    },
+    "congestion_spread": {
+      "id": "congestion_spread",
+      "display_name": "Congestion-aware placement/routing relief",
+      "description": "Captures report_design_analysis -congestion before and after, but the report is informational only: the actual optimization is a single phys_opt_design pass with placement_opt + critical_cell_opt + clock_opt + slr_crossing_opt, followed by a re-route.",
+      "use_when": [
+        "failing paths that local cell moves and critical-cell replication can improve: every transform in the bundle is a Vivado physical-optimization option that acts on failing paths and commits only timing-improving changes, so the blast radius is small",
+        "broad shallow violations where clock skew or replication tweaks can recover margin across many endpoints at once"
+      ],
+      "avoid_when": [
+        "expecting congestion-driven re-placement: no spreading, cell inflation, or region move is derived from the congestion report -- it is captured but never read by the optimization itself, so the flow name oversells the mechanism",
+        "on a single-die (single-SLR) target device: slr_crossing_opt has nothing to act on there, shrinking the bundle to a generic placement/cell-opt subset"
+      ],
+      "ceiling_note": "Mechanically a subset-strength variant of generic physical optimization -- expect the same bounded incremental profile, not congestion-scale relief."
+    },
+    "fanout": {
+      "id": "fanout",
+      "display_name": "High-fanout net splitting (RapidWright round-trip)",
+      "description": "Reports timing in Vivado, asks for critical high-fanout nets over the 50 worst paths with a minimum fanout of 100, then loads the checkpoint into RapidWright and applies a fanout optimisation to each of the top nets (default 5, set by max_nets). RapidWright writes a new checkpoint, Vivado reads it back and re-routes the design, and WNS is compared against the starting point.",
+      "use_when": [
+        "the diagnostic's fanout block shows real high-fanout structure: the flow only acts on nets above fanout 100 that appear on the 50 worst paths, so num_high_fanout_nets and max_fanout are the signals that it has anything to work on at all",
+        "critical paths are routing-dominated and the driver of a widely-shared net is a plausible cause, rather than logic depth on a narrow path",
+        "phys_opt has not already been applied to this state: its own fanout replication pass covers overlapping ground, so this flow has most to add on a state phys_opt has not seen"
+      ],
+      "avoid_when": [
+        "no net clears the fanout-100 threshold on the 50 worst paths: the flow will complete having changed effectively nothing, and still pay the full re-route cost",
+        "the state already came from phys_opt: the two mechanisms overlap on fanout replication, and this flow was long excluded from the live catalogue on exactly that assumption",
+        "an intact placement is worth protecting: this is the only live flow that round-trips the design out to RapidWright and back before a full re-route, so it carries structural risk the pure-Vivado flows do not"
+      ],
+      "ceiling_note": "Carries the joint-lowest base prior in the deterministic scorer (0.5, level with pblock, against 3.0 for phys_opt), and is the only live flow whose mechanism depends on a working RapidWright installation plus a full re-route. Expect a narrow, structure-dependent gain rather than a broad one."
+    },
+    "hardblock_relocate": {
+      "id": "hardblock_relocate",
+      "display_name": "Hard-block locality improvement",
+      "description": "Counts RAMB/DSP/URAM cells on the 50 worst paths (a diagnostic print only -- the count does not branch), then runs phys_opt placement_opt + critical_cell_opt + dsp/bram/uram register opts, re-routes, and finishes with a placement/routing cleanup pass. Despite the name, it never moves a hard block: BRAM/DSP columns are fixed, and only surrounding registers and cells move.",
+      "use_when": [
+        "hard blocks actually sit on failing paths: the register-opt options act on registers at BRAM/DSP/URAM boundaries, so nonzero DSP/BRAM utilization AND hard blocks on the worst paths is the precondition for this flow doing anything its generic siblings would not"
+      ],
+      "avoid_when": [
+        "hard-block-free failing paths: with nothing at hard-block boundaries the flow degenerates to placement_opt + critical_cell_opt, a strictly weaker generic physical-optimization pass",
+        "selecting it for macro relocation: the mechanism cannot relocate a hard block, only improve locality of the soft logic around it -- if the problem is a hard block placed far from its logic, the placement-scale flow is the one that can actually change that"
+      ],
+      "ceiling_note": "Bounded by how much of the worst-path delay is registers/logic at hard-block boundaries; it inherits phys_opt's commit-only-if-improving safety."
+    },
+    "lut_cone": {
+      "id": "lut_cone",
+      "display_name": "LUT cone depth reduction",
+      "description": "Extracts pin-level data for the 20 worst paths, selects up to 30 LUT input pins, and has RapidWright's LUTInputConeOpt merge chained small LUTs into single wider (up to 6-input) LUTs. The modified checkpoint is then written by RAPIDWRIGHT's native writer (not Vivado), reopened in Vivado, and re-routed -- with no re-placement step.",
+      "use_when": [
+        "worst paths are chains of small LUTs whose combined fan-in fits within 6 inputs (the merge precondition), and logic depth rather than route distance is the dominant delay component",
+        "verification budget exists downstream: this is the only live flow that edits the logical netlist, so functional-equivalence risk is intrinsic to the mechanism rather than incidental"
+      ],
+      "avoid_when": [
+        "route-dominated failing paths: merging shortens the logical chain, but merged LUTs are not re-placed -- only re-routed -- so wire-length problems survive the transform",
+        "anywhere checkpoint integrity matters more than upside: the output DCP comes from RapidWright's own serializer, the exact non-Vivado writer path behind the project's documented checkpoint-corruption bug (Vivado integrity-check warning on reopen; in sibling flows this sometimes silently dropped every LUT in the design)",
+        "expecting large-scale restructuring: the candidate list is capped at 30 pins per application, bounding how much depth can be removed in one run"
+      ],
+      "ceiling_note": "Each successful merge removes roughly one LUT-plus-net delay level on one path; the 30-pin cap and the merge fan-in limit keep the per-application ceiling small even in the best case."
+    },
+    "memory_path_opt": {
+      "id": "memory_path_opt",
+      "display_name": "BRAM/DSP/URAM register and path optimization",
+      "description": "A phys_opt pass with bram_register_opt + dsp_register_opt + uram_register_opt + bram_enable_opt + critical_pin_opt + equ_drivers_opt + placement_opt, a re-route, then a pin/driver/routing cleanup pass.",
+      "use_when": [
+        "failing paths cross BRAM/DSP/URAM boundaries where hard-block registers can be moved or enables optimized: the four memory-specific options only fire there, and nonzero DSP-plus-BRAM utilization is the cheap observable proxy for that precondition"
+      ],
+      "avoid_when": [
+        "DSP and BRAM utilization are both zero: all four memory-specific options are no-ops by construction and the flow degenerates to its pin/driver/placement subset -- effectively a slightly heavier net_swap at higher runtime",
+        "hard-block registers are already optimally placed/enabled from a previous application: the options move existing registers rather than creating pipeline stages, so there is a one-time budget of movable registers"
+      ],
+      "ceiling_note": "Gains concentrate where a hard-block interface is the actual worst path; elsewhere the mechanism reduces to small pin/driver cleanup."
+    },
+    "net_swap": {
+      "id": "net_swap",
+      "display_name": "LUT pin mapping and equivalent-driver rewiring",
+      "description": "Two targeted phys_opt passes -- critical_pin_opt + equ_drivers_opt with placement_opt on the first pass and routing_opt on the second -- with a re-route in between. No netlist restructure, no unplace, Vivado-native end to end.",
+      "use_when": [
+        "small residual gaps on almost any state: LUT input-pin permutation and equivalent-driver rewiring are the lowest-blast-radius transforms in the live set, acting only on failing paths and committing only improving changes"
+      ],
+      "avoid_when": [
+        "gaps that need placement- or netlist-scale change: a pin permutation cannot move a cell, and per-swap delay differences are tiny, so this cannot close a large WNS deficit",
+        "states with no failing paths: every transform is gated on negative slack, so expect a no-op"
+      ],
+      "ceiling_note": "Smallest per-move effect of the live flows by construction; the compensating property is that the mechanism has essentially no way to make the design worse."
+    },
+    "phys_opt": {
+      "id": "phys_opt",
+      "display_name": "General-purpose physical optimization",
+      "description": "phys_opt_design -directive Explore, a full route_design, then a second Explore pass. All transforms target failing paths, and Vivado commits a change only if timing improves.",
+      "use_when": [
+        "as the default probe on any state with failing paths: the Explore directive covers fanout replication, critical-cell replication, register moves, and routing-aware placement moves -- the broadest transform coverage among the non-structural flows",
+        "when a safe, bounded improvement is worth more than a risky large one: the commit-only-if-improving loop makes meaningful degradation mechanically unlikely"
+      ],
+      "avoid_when": [
+        "the state already meets timing: transforms are gated on failing paths, so expect a no-op",
+        "immediately repeating it on its own output: the first pass already committed every improving move its search found, so a re-run explores an already-harvested space"
+      ],
+      "ceiling_note": "Incremental by construction -- local moves on failing paths with a route refresh -- so it cannot deliver placement-scale change; its distinctive property is breadth plus safety, not magnitude."
+    },
+    "retime": {
+      "id": "retime",
+      "display_name": "Register retiming for pipeline balancing",
+      "description": "A place_design call (incremental on an already-placed state), then a single phys_opt_design -directive AlternateFlowWithRetiming (more aggressive replication, DSP/BRAM register optimization, and register retiming), then a re-route.",
+      "use_when": [
+        "register-imbalance states: worst paths fail while adjacent pipeline stages have slack to donate, which is the one situation the retiming transform can exploit and the other directives cannot"
+      ],
+      "avoid_when": [
+        "expecting information independent of generic physical optimization: this flow is the same phys_opt_design engine one directive apart, so on states where the retimer finds nothing to move the two flows can produce identical results -- treat them as correlated probes, not independent ones",
+        "paths bounded by fixed elements (I/O, hard-block boundaries without movable registers): the retimer needs registers that are free to cross combinational logic"
+      ],
+      "ceiling_note": "Bounded by the slack imbalance between adjacent stages -- retiming redistributes slack rather than creating it, and the rest of the directive's moves overlap generic physical optimization."
+    }
+  }
+}

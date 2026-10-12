@@ -1,0 +1,6 @@
+{
+  "python": "/replace/with/venv/bin/python",
+  "vivado": "/replace/with/Vivado/2025.1/bin/vivado",
+  "rapidwright": "/replace/with/pinned/RapidWright",
+  "java_home": "/replace/with/java-21"
+}

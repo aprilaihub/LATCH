@@ -1,0 +1,11 @@
+{
+  "provider": "minimax",
+  "adapter_type": "openai_compatible",
+  "base_url": "https://api.minimax.chat/v1",
+  "api_key_env": "MINIMAX_API_KEY",
+  "supports_json_object": true,
+  "response_format_policy": "json_object",
+  "temperature_policy": "pass_through",
+  "max_tokens_param": "max_tokens",
+  "pricing_profile": null
+}

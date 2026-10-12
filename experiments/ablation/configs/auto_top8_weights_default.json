@@ -1,0 +1,124 @@
+{
+  "auto_top8_feature_order": [
+    "route_delay_ratio",
+    "max_logic_levels",
+    "total_hardblocks",
+    "max_fanout"
+  ],
+  "auto_top8_flows": {
+    "auto_pblock": {
+      "intercept": 13.938337992853743,
+      "n_points": 83,
+      "weights": [
+        4.254651946910746,
+        -0.004400284581420388,
+        -1.7885068217042557,
+        1.2648834198865326
+      ]
+    },
+    "congestion_spread": {
+      "intercept": 4.459957807647676,
+      "n_points": 187,
+      "weights": [
+        1.5758533426875738,
+        -0.13991345998096907,
+        -1.5317734292928236,
+        -0.04494913931987173
+      ]
+    },
+    "fanout": {
+      "intercept": -1.2879787579564665,
+      "n_points": 5,
+      "weights": [
+        0.08332260681894957,
+        -0.5825937770485039,
+        -2.0141537459379264,
+        0.8837294721887335
+      ]
+    },
+    "hardblock_relocate": {
+      "intercept": 15.31616706948788,
+      "n_points": 187,
+      "weights": [
+        5.036514158690031,
+        4.364092464222311,
+        -2.395583761924613,
+        1.1009136973915161
+      ]
+    },
+    "lut_cone": {
+      "intercept": -3.8990498092159087,
+      "n_points": 95,
+      "weights": [
+        1.2129698645656386,
+        0.1518977187134768,
+        -0.36871433537415915,
+        0.9888530164616849
+      ]
+    },
+    "memory_path_opt": {
+      "intercept": 15.651749645218034,
+      "n_points": 189,
+      "weights": [
+        5.048297714775326,
+        4.422178938651632,
+        -2.4117136665389705,
+        1.5384021097399474
+      ]
+    },
+    "net_swap": {
+      "intercept": 4.476569988128433,
+      "n_points": 189,
+      "weights": [
+        1.4959606757608286,
+        0.01465195802854133,
+        -1.6954727046031637,
+        0.03128689738829721
+      ]
+    },
+    "phys_opt": {
+      "intercept": 4.946111144157054,
+      "n_points": 190,
+      "weights": [
+        1.5900537915171213,
+        0.1982615045317389,
+        -1.7777064100829472,
+        0.03289340148955234
+      ]
+    },
+    "retime": {
+      "intercept": 4.554020374537542,
+      "n_points": 190,
+      "weights": [
+        1.6076138351159517,
+        -0.18236996608473652,
+        -1.771724242082407,
+        0.06599090204157189
+      ]
+    }
+  },
+  "auto_top8_lambda": 100.0,
+  "auto_top8_note": "dense features; each benchmark weighted equally; lambda confirmed under weighting",
+  "auto_top8_source_csv": "auto_top8_v2_extrapolated.csv",
+  "auto_top8_standardisation": {
+    "max_fanout": {
+      "mean": 10437.047148288973,
+      "std": 11559.046560043122
+    },
+    "max_logic_levels": {
+      "mean": 11.73916349809886,
+      "std": 11.12997982977917
+    },
+    "route_delay_ratio": {
+      "mean": 0.5303082631178707,
+      "std": 0.2663633329735322
+    },
+    "total_hardblocks": {
+      "mean": 167.43498098859317,
+      "std": 90.13878269175666
+    }
+  },
+  "auto_top8_target": "percent_fmax_improvement",
+  "auto_top8_version": "auto_top8.v4-dense-balanced-lam100",
+  "auto_top8_weighting": "benchmark-balanced (equal total weight per benchmark)"
+}

@@ -1,0 +1,26 @@
+{
+  "amd_mini_isp": {
+    "fixed_recipe": ["lut_cone", "auto_pblock"],
+    "aws_validated": true,
+    "expected_final_fmax_mhz": 406.67,
+    "notes": ["AWS reproduced APRIL; auto_pblock produced the dominant gain."]
+  },
+  "logicnets_jscl": {
+    "fixed_recipe": ["pblock", "lut_cone", "memory_path_opt"],
+    "aws_validated": true,
+    "expected_final_fmax_mhz": 529.38,
+    "notes": ["AWS reproduced APRIL; pblock produced the dominant first-step gain."]
+  },
+  "vexriscv_re_place": {
+    "fixed_recipe": ["auto_pblock", "congestion_spread"],
+    "aws_validated": true,
+    "expected_final_fmax_mhz": 452.90,
+    "notes": ["fanout improved timing but produced unrouted pins in AWS validation; avoid chaining from invalid fanout."]
+  },
+  "vexriscv_re_place_v2": {
+    "fixed_recipe": ["rescue_place_reset_retime"],
+    "aws_validated": false,
+    "expected_final_fmax_mhz": 410.68,
+    "notes": ["APRIL rescue smoke improved v2 with placement reset and retime."]
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "flow_cards": {
+    "phys_opt": {
+      "id": "phys_opt",
+      "display_name": "Physical Optimisation",
+      "description": "Runs phys_opt_design to relocate cells and restructure logic to reduce critical-path delay after placement.",
+      "runtime_class": "medium",
+      "risk_level": "low",
+      "use_when": [
+        "wns between -0.5ns and -3ns",
+        "fanout p95 below 200",
+        "first or second optimisation pass"
+      ],
+      "avoid_when": [
+        "wns worse than -5ns",
+        "congestion level high",
+        "already applied twice in this session"
+      ],
+      "composable_with": ["retime"],
+      "redundant_after": ["auto_top3"],
+      "typical_fmax_delta_mhz": {
+        "min": -2,
+        "median": 4,
+        "max": 18
+      },
+      "notes": "Diminishing returns if run more than twice on the same DCP."
+    }
+  }
+}

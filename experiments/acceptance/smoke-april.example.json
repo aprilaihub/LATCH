@@ -1,0 +1,42 @@
+{
+  "input": "/absolute/inputs/logicnets_jscl_2025.1.dcp",
+  "golden": "/absolute/inputs/logicnets_jscl_2025.1.dcp",
+  "output": "/absolute/new/smoke-output",
+  "ledger_path": "/absolute/new/smoke-output/batch.db",
+  "period_ns": 1.5,
+  "rapidwright_revision": "2fc8b6aec859c20c04218573f9dda09db0a72e3f",
+  "tools": {
+    "python": "/absolute/venv/bin/python",
+    "vivado": "/absolute/Vivado/2025.1/bin/vivado",
+    "rapidwright": "/absolute/pinned/RapidWright",
+    "java_home": "/absolute/jre21.0.1_12"
+  },
+  "validation": {
+    "seeds": [12648430, 1592594996, 464367618, 219540062, 168939093],
+    "vectors": 200,
+    "precheck_vectors": 100,
+    "target_clock": "clk_fpl26contest",
+    "epsilon_fmax": 0,
+    "prepare_timeout_seconds": 10800,
+    "seed_timeout_seconds": 3600,
+    "score_timeout_seconds": 900,
+    "memory_reserve_fraction": 0.2,
+    "seed_memory_class": "unknown"
+  },
+  "cost": {
+    "provider": "openai",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "medium",
+    "max_requests": 200,
+    "max_input_bytes": 131072,
+    "max_output_tokens": 16384,
+    "timeout_seconds": 300,
+    "accounted_budget_usd": 10,
+    "input_usd_per_million": 0.25,
+    "output_usd_per_million": 1.2,
+    "price_source": "https://developers.openai.com/api/docs/pricing",
+    "verified_at": "2026-10-01T17:05:46Z",
+    "verified_current": false,
+    "rates_cover_all_billed_tokens": true
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "policy_type": "retrieval",
+  "online_deep_analysis": true,
+  "analysis_only": false,
+  "analysis_level": "report_probe",
+  "analysis_report_probe_backend": "cached",
+  "analysis_tool_loop_mode": "mock_llm_closed_loop",
+  "analysis_tool_timeout_sec": 30.0,
+  "analysis_root_budget_sec": 600.0,
+  "analysis_state_budget_sec": 120.0,
+  "analysis_max_states_per_expansion": 1,
+  "analysis_allow_report_probes": true,
+  "analysis_allow_act_probes": false,
+  "max_total_runs": 4,
+  "max_depth": 1,
+  "branching_factor": 4,
+  "beam_width": 2,
+  "batch_size": 4,
+  "scheduler_mode": "async",
+  "q_weight_runtime_minutes": 0.0
+}

@@ -1,0 +1,2447 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Portions of this file consist of AI-generated content.
+# SPDX-License-Identifier: Apache 2.0
+# LATCH modification: caller-owned workspace and child cwd; validation semantics retained.
+
+"""
+FPGA Design Equivalence Validator
+
+Validates that an optimized DCP is functionally equivalent to the original.
+Uses a two-phase approach:
+  Phase 1: Structural sanity checks (RapidWright)
+  Phase 2: Functional simulation comparison (Vivado + xsim)
+"""
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from contextlib import AsyncExitStack
+from pathlib import Path
+from typing import Optional, Tuple
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stderr)]
+)
+logger = logging.getLogger(__name__)
+MCP_INIT_TIMEOUT = 30.0
+DEFAULT_STIMULUS_SEED = 0xDEADBEEF
+
+
+def workspace_server_args(workspace: Path, args: list[str]) -> list[str]:
+    """Change cwd only in the owned child, including on MCP without cwd support.
+
+    exec keeps the transport's child PID and existing cleanup ownership. Do not
+    chdir the calling process: multiple validators can be active concurrently.
+    """
+    return ["-c", "import os,sys; os.chdir(sys.argv[1]); os.execv(sys.executable, [sys.executable, *sys.argv[2:]])",
+            str(workspace.resolve()), *args]
+
+
+def parse_stimulus_seed(value: str) -> int:
+    """Parse a 32-bit decimal or ``0x``-prefixed stimulus seed."""
+    try:
+        seed = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid 32-bit seed: {value}") from exc
+    if not 0 <= seed <= 0xFFFFFFFF:
+        raise argparse.ArgumentTypeError(f"seed outside 32-bit range: {value}")
+    return seed
+
+
+def ensure_vivado_on_path(env: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """Return an environment with the Vivado binary directory on PATH.
+
+    RapidWright can invoke `vivado` while auto-generating readable EDIF files
+    from DCPs.  APRIL runs usually provide VIVADO_EXEC or VIVADO_PATH as an
+    absolute binary path, but RapidWright's Java layer still needs `vivado` to
+    resolve from PATH.
+    """
+    base = dict(os.environ if env is None else env)
+    candidates = [
+        base.get("VIVADO_EXEC"),
+        base.get("VIVADO_PATH"),
+        base.get("VIVADO_BIN"),
+        "vivado",
+    ]
+
+    vivado_bin: Optional[Path] = None
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate_path = Path(candidate).expanduser()
+        if candidate_path.is_dir():
+            candidate_path = candidate_path / "vivado"
+        if os.sep in candidate or candidate_path.is_absolute():
+            if candidate_path.exists():
+                vivado_bin = candidate_path.parent.resolve()
+                break
+            continue
+        resolved = shutil.which(candidate, path=base.get("PATH"))
+        if resolved:
+            vivado_bin = Path(resolved).parent.resolve()
+            break
+
+    if vivado_bin is None:
+        return base
+
+    current_path = base.get("PATH", "")
+    path_entries = current_path.split(os.pathsep) if current_path else []
+    vivado_bin_str = str(vivado_bin)
+    if vivado_bin_str not in path_entries:
+        base["PATH"] = vivado_bin_str + (os.pathsep + current_path if current_path else "")
+    return base
+
+
+def sanitize_identifier(name: str) -> str:
+    """Convert an arbitrary interface prefix into a valid Verilog identifier."""
+    ident = re.sub(r'[^0-9A-Za-z_]', '_', name)
+    ident = re.sub(r'_+', '_', ident).strip('_')
+    if not ident:
+        ident = "ifc"
+    if ident[0].isdigit():
+        ident = f"ifc_{ident}"
+    return ident
+
+
+def port_bit_width(port: dict) -> int:
+    """Return the bit width for a parsed Verilog port dictionary."""
+    width = port.get('width')
+    if not width:
+        return 1
+    match = re.match(r'\[\s*(\d+)\s*:\s*(\d+)\s*\]', width)
+    if not match:
+        return 1
+    return abs(int(match.group(1)) - int(match.group(2))) + 1
+
+
+def assign_from_seed(port: dict, seed_expr: str, indent: str = "            ") -> str:
+    """Generate a Verilog assignment using chunk-varying seed data."""
+    bits = port_bit_width(port)
+    name = port['name']
+    # Rely on Verilog assignment truncation/extension for <=32-bit ports.
+    # Indexing a parenthesized expression like "(a ^ b)[7:0]" is rejected by
+    # xvlog in the Verilog mode used here.
+    if bits <= 32:
+        return f"{indent}{name} = {seed_expr};"
+    chunks = (bits + 31) // 32
+    chunk_exprs = []
+    for idx in range(chunks):
+        mask = (0x9E3779B9 * (idx + 1)) & 0xFFFFFFFF
+        chunk_exprs.append(f"({seed_expr} ^ 32'h{mask:08X})")
+    return f"{indent}{name} = {{{', '.join(reversed(chunk_exprs))}}};"
+
+
+def parse_simulation_output(sim_output: str, returncode: int, expected_cycles: int) -> dict:
+    """Parse xsim output and compute the validator pass/fail fields."""
+    mismatch_count = 0
+    protocol_mismatch_count = 0
+    cycles_simulated = 0
+    result_pass_seen = False
+    result_fail_seen = False
+    simulator_failed = False
+
+    fatal_patterns = [
+        r'Simulation engine not responding',
+        r'Simulator command interrupted',
+        r'Command failed:',
+        r'terminated in an unexpected manner',
+        r'\bFATAL\b',
+        r'\bUSF-XSim\b',
+        r'\bXSIM\s+\d+-\d+\b',
+    ]
+    fatal_re = re.compile('|'.join(fatal_patterns), re.IGNORECASE)
+
+    for line in sim_output.split('\n'):
+        if 'PROTOCOL MISMATCH' in line:
+            protocol_mismatch_count += 1
+        elif 'MISMATCH' in line:
+            mismatch_count += 1
+        elif 'Cycles simulated:' in line:
+            match = re.search(r'Cycles simulated:\s*(\d+)', line)
+            if match:
+                cycles_simulated = int(match.group(1))
+        elif 'Mismatches found:' in line:
+            match = re.search(r'Mismatches found:\s*(\d+)', line)
+            if match:
+                mismatch_count = int(match.group(1))
+        elif 'Protocol mismatches found:' in line:
+            match = re.search(r'Protocol mismatches found:\s*(\d+)', line)
+            if match:
+                protocol_mismatch_count = int(match.group(1))
+        elif 'Result: PASS' in line:
+            result_pass_seen = True
+        elif 'Result: FAIL' in line:
+            result_fail_seen = True
+
+        if fatal_re.search(line):
+            simulator_failed = True
+
+    passed = (
+        returncode == 0
+        and result_pass_seen
+        and not result_fail_seen
+        and not simulator_failed
+        and cycles_simulated == expected_cycles
+        and mismatch_count == 0
+        and protocol_mismatch_count == 0
+    )
+
+    # Logical mismatches are definitive design failures. Do not relabel them as
+    # infrastructure failures even if xsim also emits a fatal-looking message.
+    definitive_fail = (
+        result_fail_seen
+        or mismatch_count > 0
+        or protocol_mismatch_count > 0
+    )
+    infrastructure_failure = not definitive_fail and (
+        simulator_failed
+        or (not result_pass_seen and not result_fail_seen)
+    )
+    infrastructure_reason = None
+    if infrastructure_failure:
+        if simulator_failed:
+            infrastructure_reason = "simulator_failed"
+        elif not result_pass_seen and not result_fail_seen:
+            infrastructure_reason = "testbench_completion_marker_missing"
+
+    return {
+        "cycles_simulated": cycles_simulated,
+        "mismatch_count": mismatch_count,
+        "protocol_mismatch_count": protocol_mismatch_count,
+        "result_pass_seen": result_pass_seen,
+        "result_fail_seen": result_fail_seen,
+        "simulator_failed": simulator_failed,
+        "infrastructure_failure": infrastructure_failure,
+        "infrastructure_reason": infrastructure_reason,
+        "returncode": returncode,
+        "passed": passed,
+    }
+
+
+class ValidatorIncompatibility(ValueError):
+    """A design cannot satisfy the frozen external-I/O validation contract."""
+
+    def __init__(self, terminal: str, detail: str):
+        super().__init__(detail)
+        self.terminal = terminal
+
+
+class DCPValidator:
+    """Validates functional equivalence between two DCPs."""
+
+    def __init__(
+        self,
+        golden_dcp: Path,
+        revised_dcp: Path,
+        num_vectors: int = 200,
+        precheck_vectors: int = 100,
+        debug: bool = False,
+        no_reactive: bool = False,
+        stimulus_seeds: Optional[list[int]] = None,
+        stimulus_profile: str = "random",
+        simulation_mode: str = "functional",
+        prepare_seed_workspace_only: bool = False,
+        workspace_dir: Optional[Path] = None,
+    ):
+        os.environ.update(ensure_vivado_on_path())
+        self.golden_dcp = golden_dcp
+        self.revised_dcp = revised_dcp
+        self.num_vectors = num_vectors
+        self.precheck_vectors = precheck_vectors
+        self.debug = debug
+        self.no_reactive = no_reactive
+        self.stimulus_seeds = list(stimulus_seeds or [DEFAULT_STIMULUS_SEED])
+        if not self.stimulus_seeds:
+            raise ValueError("at least one stimulus seed is required")
+        if stimulus_profile not in {"random", "directed"}:
+            raise ValueError(f"unsupported stimulus profile: {stimulus_profile}")
+        self.stimulus_profile = stimulus_profile
+        if simulation_mode not in {"functional", "timing"}:
+            raise ValueError(f"unsupported simulation mode: {simulation_mode}")
+        self.simulation_mode = simulation_mode
+        self.prepare_seed_workspace_only = bool(prepare_seed_workspace_only)
+        self.seed_workspace_prepared = False
+        self.interface_audit = None
+        self.clock_period_ns = 10.0
+
+        self.exit_stack = AsyncExitStack()
+        self.rapidwright_session: Optional[ClientSession] = None
+        self.vivado_session: Optional[ClientSession] = None
+
+        # Create temporary directory for intermediate files in workspace
+        # (avoids /tmp running out of space for large designs)
+        validation_workspace = Path(__file__).parent if workspace_dir is None else Path(workspace_dir).resolve()
+        validation_workspace.mkdir(parents=True, exist_ok=True)
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="dcp_validation_", dir=validation_workspace))
+        logger.info(f"Working directory: {self.temp_dir}")
+
+        # Results
+        self.phase1_passed = False
+        self.phase2_passed = False
+        self.phase2_skipped = False
+        self.phase2_skip_reason = None
+        self.structural_report = None
+        self.simulation_report = None
+        self.preflight_report = None
+        self.infrastructure_failure = False
+        self.infrastructure_reason = None
+        self.validator_incompatibility = None
+        self.validator_incompatibility_detail = None
+
+    def _copy_dcp_for_rapidwright(self, src_dcp: Path, label: str) -> Path:
+        """Copy a DCP into validator-owned space and build a fresh EDIF sidecar."""
+        if not src_dcp.exists():
+            raise FileNotFoundError(f"{label} DCP not found: {src_dcp}")
+
+        prepared_dcp = self.temp_dir / f"{label}.dcp"
+        shutil.copy2(src_dcp, prepared_dcp)
+
+        unzip_result = subprocess.run(
+            ["unzip", "-t", str(prepared_dcp)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if unzip_result.returncode != 0:
+            detail = (unzip_result.stdout + unzip_result.stderr).strip()
+            raise RuntimeError(f"{label} DCP failed zip integrity check: {detail}")
+
+        sidecar_dir = self.temp_dir / f"{label}.dcp.edf"
+        if sidecar_dir.exists():
+            shutil.rmtree(sidecar_dir)
+        sidecar_dir.mkdir()
+        sidecar_edf = sidecar_dir / f"{label}.edf"
+        sidecar_md5 = sidecar_dir / f"{label}.dcp.md5"
+
+        vivado_path = os.environ.get("VIVADO_EXEC")
+        if vivado_path:
+            if "/" not in vivado_path:
+                vivado_path = shutil.which(vivado_path)
+        else:
+            vivado_path = shutil.which("vivado")
+        if not vivado_path:
+            raise RuntimeError("Vivado not found in PATH. Set VIVADO_EXEC env var or add Vivado to PATH.")
+
+        tcl_path = self.temp_dir / f"prepare_{label}_readable_edif.tcl"
+        tcl_path.write_text(
+            f"open_checkpoint {{{prepared_dcp}}}\n"
+            f"write_edif -force {{{sidecar_edf}}}\n"
+            "close_design\n"
+        )
+        log_path = self.temp_dir / f"prepare_{label}_readable_edif.log"
+        jou_path = self.temp_dir / f"prepare_{label}_readable_edif.jou"
+        result = subprocess.run(
+            [
+                vivado_path,
+                "-mode", "batch",
+                "-source", str(tcl_path),
+                "-log", str(log_path),
+                "-journal", str(jou_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        if result.returncode != 0 or not sidecar_edf.exists() or sidecar_edf.stat().st_size == 0:
+            detail = (result.stdout + result.stderr).strip()
+            raise RuntimeError(
+                f"{label} DCP opened, but readable EDIF generation failed. "
+                f"Log: {log_path}. {detail[-1000:]}"
+            )
+
+        md5_result = subprocess.run(
+            ["md5sum", str(prepared_dcp)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+        sidecar_md5.write_text(md5_result.stdout.split()[0] + "\n")
+        return prepared_dcp
+
+    def _is_rapidwright_readability_error(self, report: dict) -> bool:
+        """Return true for RapidWright DCP/EDIF cache/read failures."""
+        error = str(report.get("error", ""))
+        patterns = [
+            "Unable to find a readable EDIF file",
+            "ZipException",
+            "zip archive",
+            "dcp.xml",
+            "Failed to auto-generate an EDIF file",
+            "invalid LOC header",
+            "bad signature",
+        ]
+        return any(pattern in error for pattern in patterns)
+
+    async def _compare_design_structures(self, golden_dcp: Path, revised_dcp: Path) -> dict:
+        result = await self.rapidwright_session.call_tool("compare_design_structure", {
+            "golden_dcp": str(golden_dcp),
+            "revised_dcp": str(revised_dcp),
+        })
+
+        if result.content:
+            text_parts = [c.text for c in result.content if hasattr(c, 'text')]
+            result_text = "\n".join(text_parts)
+            return json.loads(result_text)
+        return {"error": "No response from tool"}
+
+    async def _initialize_mcp_session(
+        self,
+        session: ClientSession,
+        server_name: str,
+        diagnostics_target: str,
+        timeout: float = MCP_INIT_TIMEOUT,
+    ):
+        """Initialize an MCP session with a clear timeout error."""
+        try:
+            await asyncio.wait_for(session.initialize(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"{server_name} MCP handshake timed out after {timeout:.0f}s. "
+                f"Check {diagnostics_target} for startup diagnostics."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"{server_name} MCP handshake failed. "
+                f"Check {diagnostics_target} for startup diagnostics. "
+                f"Original error: {exc}"
+            ) from exc
+
+    async def start_servers(self):
+        """Start both MCP servers."""
+        script_dir = Path(__file__).parent.resolve()
+
+        # Create log files in temp directory
+        rapidwright_log = self.temp_dir / "rapidwright.log"
+        rapidwright_mcp_log = self.temp_dir / "rapidwright-mcp.log"
+        vivado_log = self.temp_dir / "vivado.log"
+        vivado_journal = self.temp_dir / "vivado.jou"
+        vivado_mcp_log = self.temp_dir / "vivado-mcp.log"
+
+        # RapidWright MCP - with log redirection
+        rapidwright_args = [str(script_dir / "RapidWrightMCP" / "server.py")]
+        if not self.debug:
+            rapidwright_args.extend([
+                "--java-log", str(rapidwright_log),
+                "--mcp-log", str(rapidwright_mcp_log)
+            ])
+
+        rapidwright_config = {
+            "command": sys.executable,
+            "args": workspace_server_args(self.temp_dir, rapidwright_args),
+            "env": {**os.environ}
+        }
+
+        logger.info("Starting RapidWright MCP server...")
+        rw_params = StdioServerParameters(**rapidwright_config)
+        rw_transport = await self.exit_stack.enter_async_context(stdio_client(rw_params))
+        rw_read, rw_write = rw_transport
+        self.rapidwright_session = await self.exit_stack.enter_async_context(
+            ClientSession(rw_read, rw_write)
+        )
+        rw_diagnostics = "console output" if self.debug else str(rapidwright_mcp_log)
+        await self._initialize_mcp_session(
+            self.rapidwright_session,
+            "RapidWright",
+            rw_diagnostics,
+        )
+
+        # Vivado MCP - with log redirection
+        vivado_args = [str(script_dir / "VivadoMCP" / "vivado_mcp_server.py")]
+        if not self.debug:
+            vivado_args.extend([
+                "--vivado-log", str(vivado_log),
+                "--vivado-journal", str(vivado_journal)
+            ])
+
+        vivado_config = {
+            "command": sys.executable,
+            "args": workspace_server_args(self.temp_dir, vivado_args),
+            "env": {**os.environ}
+        }
+
+        logger.info("Starting Vivado MCP server...")
+        v_params = StdioServerParameters(**vivado_config)
+        v_transport = await self.exit_stack.enter_async_context(stdio_client(v_params))
+        v_read, v_write = v_transport
+        self.vivado_session = await self.exit_stack.enter_async_context(
+            ClientSession(v_read, v_write)
+        )
+        v_diagnostics = "console output" if self.debug else str(vivado_mcp_log)
+        await self._initialize_mcp_session(
+            self.vivado_session,
+            "Vivado",
+            v_diagnostics,
+        )
+
+        logger.info("Both MCP servers started")
+
+    async def phase1_structural_checks(self) -> bool:
+        """Phase 1: Structural sanity checks using RapidWright."""
+        print("\n" + "="*70)
+        print("PHASE 1: STRUCTURAL SANITY CHECKS")
+        print("="*70)
+
+        # Initialize RapidWright
+        logger.info("Initializing RapidWright...")
+        result = await self.rapidwright_session.call_tool("initialize_rapidwright", {})
+
+        # Compare designs
+        logger.info("Comparing design structures...")
+        print("\nComparing design structures...")
+
+        self.structural_report = await self._compare_design_structures(
+            self.golden_dcp.resolve(),
+            self.revised_dcp.resolve(),
+        )
+
+        if (
+            "error" in self.structural_report
+            and self._is_rapidwright_readability_error(self.structural_report)
+        ):
+            initial_error = self.structural_report["error"]
+            print("\nRapidWright could not read one of the DCPs directly.")
+            print("Preparing validator-owned DCP copies and readable EDIF sidecars, then retrying...")
+            try:
+                prepared_golden = self._copy_dcp_for_rapidwright(self.golden_dcp.resolve(), "golden")
+                prepared_revised = self._copy_dcp_for_rapidwright(self.revised_dcp.resolve(), "revised")
+                self.preflight_report = {
+                    "status": "success",
+                    "reason": "rapidwright_readability_retry",
+                    "initial_error": initial_error,
+                    "golden_prepared_dcp": str(prepared_golden),
+                    "revised_prepared_dcp": str(prepared_revised),
+                }
+                self.structural_report = await self._compare_design_structures(
+                    prepared_golden,
+                    prepared_revised,
+                )
+                if "error" in self.structural_report:
+                    self.structural_report["preflight_report"] = self.preflight_report
+            except Exception as e:
+                self.preflight_report = {
+                    "status": "error",
+                    "stage": "rapidwright_dcp_preparation",
+                    "initial_error": initial_error,
+                    "error": str(e),
+                }
+                self.structural_report = {
+                    "error": str(e),
+                    "preflight_report": self.preflight_report,
+                }
+                print(f"\n✗ DCP preflight retry failed: {e}")
+                return False
+        else:
+            self.preflight_report = {
+                "status": "not_needed",
+                "reason": "rapidwright_direct_compare_succeeded_or_non_readability_failure",
+            }
+
+        # Check if passed
+        if "error" in self.structural_report:
+            print(f"\n✗ ERROR: {self.structural_report['error']}")
+            return False
+
+        comparison_result = self.structural_report.get("comparison_result", "FAIL")
+        checks_passed = self.structural_report.get("checks_passed", 0)
+        checks_total = self.structural_report.get("checks_total", 0)
+        issues = self.structural_report.get("issues", [])
+
+        # Separate INFO issues from real issues
+        info_issues = [i for i in issues if i.startswith("INFO:")]
+        real_issues = [i for i in issues if not i.startswith("INFO:")]
+
+        print(f"\nStructural Checks: {checks_passed}/{checks_total} passed")
+
+        if real_issues:
+            print("\nIssues found:")
+            for issue in real_issues:
+                print(f"  - {issue}")
+
+        if info_issues:
+            print("\nInformational notes:")
+            for issue in info_issues:
+                print(f"  ℹ {issue[5:].strip()}")  # Remove "INFO:" prefix
+
+        if not real_issues and not info_issues:
+            print("\nNo issues found - designs are structurally compatible")
+
+        self.phase1_passed = (comparison_result == "PASS")
+
+        print("\n" + "-"*70)
+        if self.phase1_passed:
+            print("Phase 1: PASSED ✓")
+        else:
+            print("Phase 1: FAILED ✗")
+        print("-"*70)
+
+        return self.phase1_passed
+
+    def _check_for_encrypted_ip(self, verilog_path: Path) -> bool:
+        """Check if Verilog file contains encrypted or SIP IP blocks."""
+        with open(verilog_path, 'r') as f:
+            content = f.read(200000)  # Check first 200KB
+
+        # Look for SIP modules, encrypted IP, or hard IP blocks that require special libraries
+        sip_patterns = [
+            r'GTYE4_CHANNEL',       # GTY transceivers
+            r'GTYE4_COMMON',        # GTY common blocks
+            r'GTHE4_CHANNEL',       # GTH transceivers
+            r'GTHE3_CHANNEL',       # GTH transceivers (UltraScale)
+            r'GTYE3_CHANNEL',       # GTY transceivers (UltraScale)
+            r'PCIE40E4',            # PCIe Gen4 x16
+            r'PCIE4CE4',            # PCIe Gen4 CCIX
+            r'PCIE_3_1',            # PCIe Gen3
+            r'CMAC',                # 100G Ethernet MAC
+            r'ILKN',                # Interlaken
+            r'SIP_',                # Any SIP module
+            r'encrypted',           # Encrypted netlist
+            r'ENCRYPTED_VERILOG'    # Encrypted Verilog marker
+        ]
+
+        for pattern in sip_patterns:
+            if re.search(pattern, content, re.IGNORECASE):
+                logger.debug(f"Found encrypted/SIP pattern: {pattern}")
+                return True
+
+        return False
+
+    def _is_encrypted_ip_error(self, error_text: str) -> bool:
+        """Check if elaboration error is due to encrypted/SIP IP."""
+        sip_error_patterns = [
+            r'Module\s+<SIP_',           # Module <SIP_xxx> not found
+            r'SIP_GTYE4',
+            r'SIP_GTHE4',
+            r'SIP_PCIE',
+            r'instantiating unknown module SIP_',
+        ]
+
+        for pattern in sip_error_patterns:
+            if re.search(pattern, error_text, re.IGNORECASE):
+                logger.debug(f"Found SIP error pattern: {pattern}")
+                return True
+
+        return False
+
+    # Tcl helper that emits the top-level clock port names of the currently
+    # open design between sentinel markers. Sourced into Vivado on demand.
+    #
+    # Three strategies, applied in order, with results de-duplicated:
+    #   1. exact top-level ports attached to Vivado clock objects;
+    #   2. ``all_fanin -startpoints_only`` from every pin in the clock
+    #      networks back to primary inputs - this handles the common case
+    #      where create_clock is bound to an internal pin (e.g. a BUFG
+    #      output) rather than a top-level port, which is the case for
+    #      Chisel-style designs (e.g. boom_soc whose clock object source
+    #      is empty but whose actual port is ``clock_uncore_clock``).
+    #   3. Trace primary inputs feeding the I pin of any global clock
+    #      buffer (BUFG*, IBUFG*) - this catches designs that have no
+    #      ``create_clock`` constraints at all but still have a clearly
+    #      identifiable clock input port.
+    #
+    # The marker strings printed at runtime are assembled with ``format``
+    # rather than written as string literals so they don't appear verbatim
+    # in this source - if they did, Vivado's echo of the proc body during
+    # ``source`` would falsely match the Python-side regex.
+    _CLOCK_PORT_DETECT_TCL = r"""
+proc __vd_emit_clock_port {sp seenVar} {
+    upvar 1 $seenVar seen
+    if {[get_property CLASS $sp] ne {port}} { return }
+    if {[get_property DIRECTION $sp] ne {IN}} { return }
+    set nm [get_property NAME $sp]
+    if {[dict exists $seen $nm]} { return }
+    dict set seen $nm 1
+    set bn [get_property BUS_NAME $sp]
+    if {$bn eq {}} { puts $nm } else { puts $bn }
+}
+
+proc __vd_find_clock_ports {} {
+    set seen [dict create]
+    set mB [format {_%s_VDCLKP_%sIN__} {} {BEG}]
+    set mE [format {_%s_VDCLKP_%s__}   {} {ENDX}]
+    puts $mB
+    set clocks [get_clocks -quiet]
+    # A primary create_clock retains an exact top-level source relationship.
+    # Prefer it to a fan-in traversal: on very large RapidWright-imported
+    # designs the latter may include unrelated control startpoints feeding
+    # sequential primitives (for example reset/ready inputs).
+    foreach sp [get_ports -quiet -of_objects $clocks] {
+        __vd_emit_clock_port $sp seen
+    }
+    if {[dict size $seen] == 0} {
+        set clk_pins [get_pins -quiet -of_objects $clocks]
+        if {[llength $clk_pins] > 0} {
+            foreach sp [all_fanin -quiet -flat -startpoints_only $clk_pins] {
+                __vd_emit_clock_port $sp seen
+            }
+        }
+        foreach c [get_cells -quiet -hier -filter {REF_NAME =~ BUFG* || REF_NAME =~ IBUFG*}] {
+            foreach ipin [get_pins -quiet -of_objects $c -filter {DIRECTION == IN}] {
+                foreach sp [all_fanin -quiet -flat -startpoints_only $ipin] {
+                    __vd_emit_clock_port $sp seen
+                }
+            }
+        }
+    }
+    puts $mE
+}
+"""
+
+    async def _query_clock_ports_from_vivado(self) -> list:
+        """Query Vivado for the top-level clock port names of the open design.
+
+        Uses Vivado's clock-network connectivity rather than guessing from
+        port names; see ``_CLOCK_PORT_DETECT_TCL`` for the strategies. Returns
+        an empty list on any failure (caller falls back to a name heuristic),
+        and de-duplicates bus bits like ``clk[0]`` -> ``clk``.
+        """
+        # Write the helper script to disk once and source it on each call.
+        # ``run_tcl`` sends a single line, so a sourced proc keeps the wire
+        # protocol simple (vs. encoding multi-line Tcl with semicolons).
+        helper_path = self.temp_dir / "find_clock_ports.tcl"
+        if not helper_path.exists():
+            with open(helper_path, "w") as f:
+                f.write(self._CLOCK_PORT_DETECT_TCL)
+
+        cmd = f"source {{{helper_path}}}; __vd_find_clock_ports"
+        try:
+            result = await self.vivado_session.call_tool(
+                "run_tcl", {"command": cmd, "timeout": 120}
+            )
+        except Exception as e:
+            logger.warning(f"Failed to query clock ports from Vivado: {e}")
+            return []
+
+        if not result.content:
+            return []
+        text = "\n".join(c.text for c in result.content if hasattr(c, 'text'))
+
+        # Markers must match the dynamic ``format`` calls in the Tcl helper.
+        m = re.search(
+            r'__VDCLKP_BEGIN__\s*(.*?)\s*__VDCLKP_ENDX__',
+            text, re.DOTALL,
+        )
+        if not m:
+            logger.debug(f"Clock-port markers not found in run_tcl output; got: {text[:500]!r}")
+            return []
+
+        names: list = []
+        seen: set = set()
+        # Valid Verilog port identifiers are word characters; reject anything
+        # that isn't, which filters out Vivado command echo lines (``# ...``),
+        # warning/info banners, and stray punctuation.
+        valid = re.compile(r'^\w+(?:\[\d+\])?$')
+        for line in m.group(1).splitlines():
+            name = line.strip()
+            if not name or not valid.match(name):
+                continue
+            # Strip a single trailing bus index so bit-level port objects
+            # like "clk[0]" collapse to the bus name "clk" we parsed from
+            # the Verilog port list.
+            name = re.sub(r'\[\d+\]$', '', name)
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+        return names
+
+    async def _query_clock_period_ns_from_vivado(self) -> float:
+        """Return the smallest positive clock period, falling back to 10 ns."""
+        command = (
+            "puts __VDPERIOD_BEGIN__; "
+            "foreach c [get_clocks -quiet] {puts [get_property PERIOD $c]}; "
+            "puts __VDPERIOD_END__"
+        )
+        try:
+            result = await self.vivado_session.call_tool(
+                "run_tcl", {"command": command, "timeout": 120}
+            )
+            text = "\n".join(
+                item.text for item in result.content if hasattr(item, "text")
+            )
+            match = re.search(
+                r"__VDPERIOD_BEGIN__\s*(.*?)\s*__VDPERIOD_END__",
+                text,
+                re.DOTALL,
+            )
+            values = [] if not match else [
+                float(line.strip())
+                for line in match.group(1).splitlines()
+                if re.fullmatch(r"\d+(?:\.\d+)?", line.strip())
+            ]
+            positive = [value for value in values if value > 0]
+            if positive:
+                return min(positive)
+        except Exception as exc:
+            logger.warning("Failed to query clock period: %s", exc)
+        return 10.0
+
+    def get_design_info_from_verilog(self, verilog_path: Path) -> dict:
+        """Extract design information from Verilog file (module name, ports)."""
+        with open(verilog_path, 'r') as f:
+            lines = f.readlines()
+
+        module_names = []
+        for line in lines:
+            match = re.match(r'^\s*module\s+(?:automatic\s+)?(\w+)', line)
+            if match:
+                module_names.append(match.group(1))
+        module_set = set(module_names)
+
+        # Ordered generic contract: RapidWright Design.getName(), EDIF netlist
+        # top cell, then a deterministic exported-Verilog hierarchy audit.
+        design_key = "golden_design" if "golden" in str(verilog_path) else "revised_design"
+        candidates = []
+        if self.structural_report:
+            design = self.structural_report.get(design_key, {})
+            candidates = [
+                design.get("design_name"),
+                design.get("netlist_top_cell"),
+                design.get("top_module"),
+            ]
+        candidates = [
+            str(value).strip() for value in candidates
+            if value is not None and str(value).strip().lower() not in {"", "null", "none"}
+        ]
+        target_module_name = next(
+            (name for name in dict.fromkeys(candidates) if name in module_set), None
+        )
+
+        if target_module_name is None:
+            instantiated = set()
+            for line in lines:
+                match = re.match(
+                    r'^\s*(\w+)\s*(?:#\s*\([^;]*\)\s*)?\w+\s*\(', line
+                )
+                if match and match.group(1) in module_set:
+                    instantiated.add(match.group(1))
+            hierarchy_tops = sorted(module_set - instantiated)
+            if len(hierarchy_tops) == 1:
+                target_module_name = hierarchy_tops[0]
+            else:
+                raise ValidatorIncompatibility(
+                    "VALIDATOR_INCOMPATIBLE_TOP_MODULE",
+                    "unable to resolve a unique exported-Verilog top module; "
+                    f"rapidwright_candidates={candidates}, hierarchy_candidates={hierarchy_tops}",
+                )
+
+        # Parse line by line to find target module and its ports
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            # Look for module declaration
+            if re.match(r'^\s*module\s+', line):
+                module_match = re.search(r'module\s+(?:automatic\s+)?(\w+)', line)
+                if not module_match:
+                    i += 1
+                    continue
+
+                module_name = module_match.group(1)
+
+                # Check if this is the module we're looking for
+                if target_module_name and module_name != target_module_name:
+                    i += 1
+                    continue
+
+                # Found the target module, now parse its ports
+                # Skip past the port list in parentheses to the port declarations
+                while i < len(lines) and ');' not in lines[i]:
+                    i += 1
+                i += 1  # Skip the "); line
+
+                # Now parse port declarations (input/output/inout lines)
+                # Store as list of dicts with 'name' and 'width' (e.g., [63:0] or None for single bit)
+                ports = {"inputs": [], "outputs": [], "inouts": []}
+
+                while i < len(lines):
+                    line = lines[i].strip()
+
+                    # Stop at wire declarations (ports section is done)
+                    if line.startswith('wire ') or line.startswith('reg ') or line == '':
+                        break
+
+                    if line.startswith('input '):
+                        # Match: input [high:low] name; or input name;
+                        port_match = re.search(r'input\s+(?:\[(\d+):(\d+)\]\s*)?(\w+)', line)
+                        if port_match:
+                            high_bit = port_match.group(1)
+                            low_bit = port_match.group(2)
+                            name = port_match.group(3)
+                            width = f"[{high_bit}:{low_bit}]" if high_bit else None
+                            ports["inputs"].append({"name": name, "width": width})
+                    elif line.startswith('output '):
+                        port_match = re.search(r'output\s+(?:\[(\d+):(\d+)\]\s*)?(\w+)', line)
+                        if port_match:
+                            high_bit = port_match.group(1)
+                            low_bit = port_match.group(2)
+                            name = port_match.group(3)
+                            width = f"[{high_bit}:{low_bit}]" if high_bit else None
+                            ports["outputs"].append({"name": name, "width": width})
+                    elif line.startswith('inout '):
+                        port_match = re.search(r'inout\s+(?:\[(\d+):(\d+)\]\s*)?(\w+)', line)
+                        if port_match:
+                            high_bit = port_match.group(1)
+                            low_bit = port_match.group(2)
+                            name = port_match.group(3)
+                            width = f"[{high_bit}:{low_bit}]" if high_bit else None
+                            ports["inouts"].append({"name": name, "width": width})
+
+                    i += 1
+
+                # Found target module with ports
+                return {"module_name": module_name, "ports": ports}
+
+            i += 1
+
+        raise ValidatorIncompatibility(
+            "VALIDATOR_INCOMPATIBLE_TOP_MODULE",
+            f"resolved module '{target_module_name}' was not parseable in {verilog_path}",
+        )
+
+    def generate_testbench(self, golden_info: dict, revised_info: dict, tb_path: Path,
+                           clock_names: Optional[list] = None,
+                           clock_period_ns: float = 10.0):
+        """Generate Verilog testbench for comparing two designs.
+
+        ``clock_names`` is the authoritative list of top-level clock port names
+        as reported by Vivado's ``get_clocks``/``get_ports`` traversal. When
+        provided we use it directly; otherwise we fall back to a name-based
+        heuristic (which fails for Chisel/Rocket-Chip-style designs whose
+        clocks are named ``clock`` rather than ``clk``).
+        """
+        golden_module = golden_info["module_name"]
+        revised_module = revised_info["module_name"] + "_revised"  # Use renamed module
+
+        inputs = golden_info["ports"]["inputs"]  # List of {name, width}
+        outputs = golden_info["ports"]["outputs"]  # List of {name, width}
+
+        if not inputs and not outputs:
+            raise ValidatorIncompatibility(
+                "VALIDATOR_INCOMPATIBLE_ZERO_OBSERVABLE_IO",
+                "exported functional top has zero inputs and zero outputs",
+            )
+
+        # A crash-only simulation is not sampled functional equivalence.
+        if not outputs:
+            raise ValidatorIncompatibility(
+                "VALIDATOR_INCOMPATIBLE_ZERO_OBSERVABLE_IO",
+                "exported functional top has no observable outputs",
+            )
+
+        # Identify clocks. Prefer the constraint-based list from Vivado; fall
+        # back to a broadened substring heuristic only if Vivado gave us
+        # nothing (e.g. an unconstrained design with no SDC).
+        clocks: list = []
+        if clock_names:
+            wanted = set(clock_names)
+            clocks = [p for p in inputs if p['name'] in wanted]
+            missing = wanted - {p['name'] for p in clocks}
+            if missing:
+                logger.warning(
+                    f"Vivado-reported clock ports not found among top-level "
+                    f"inputs: {sorted(missing)}"
+                )
+        if not clocks:
+            if clock_names:
+                logger.warning(
+                    "No Vivado-reported clocks matched top-level inputs; "
+                    "falling back to name-based heuristic"
+                )
+            clocks = [
+                p for p in inputs
+                if 'clk' in p['name'].lower() or 'clock' in p['name'].lower()
+            ]
+
+        # Reset detection remains heuristic - DCPs do not carry a canonical
+        # "this port is the reset" property the way they do for clocks.
+        clock_port_names = {p['name'] for p in clocks}
+        resets = [
+            p for p in inputs
+            if p['name'] not in clock_port_names
+            and ('rst' in p['name'].lower() or 'reset' in p['name'].lower())
+        ]
+
+        if not clocks:
+            raise ValidatorIncompatibility(
+                "VALIDATOR_INCOMPATIBLE_NO_CLOCK_PORT",
+                "No clock signal found in design",
+            )
+
+        # Everything that isn't a clock or reset is driven by the LFSR stimulus.
+        special_names = {p['name'] for p in clocks} | {p['name'] for p in resets}
+        regular_inputs = [p for p in inputs if p['name'] not in special_names]
+
+        clock = clocks[0]['name']
+        reset = resets[0]['name'] if resets else None
+
+        input_by_name = {p['name']: p for p in regular_inputs}
+        output_by_name = {p['name']: p for p in outputs}
+
+        controlled_inputs = set()
+        response_ifaces = []
+        request_ifaces = []
+        ready_bias_inputs = []
+        hls_iface = None
+        used_iface_ids = {}
+
+        def unique_iface_id(prefix: str) -> str:
+            base = sanitize_identifier(prefix)
+            count = used_iface_ids.get(base, 0)
+            used_iface_ids[base] = count + 1
+            if count == 0:
+                return base
+            return f"{base}_{count}"
+
+        # Detect simple master-side request/response interfaces where the DUT
+        # emits commands and expects a response on top-level inputs. The
+        # validator will emulate a one-deep reactive responder using golden DUT
+        # outputs as the reference handshake source.
+        for port in regular_inputs:
+            name = port['name']
+            if not name.endswith('_rsp_valid'):
+                continue
+            prefix = name[:-len('_rsp_valid')]
+            cmd_valid_out = next(
+                (
+                    candidate for candidate in (
+                        f"{prefix}_cmd_valid",
+                        f"{prefix}_valid",
+                        f"{prefix}_tvalid",
+                    )
+                    if candidate in output_by_name
+                ),
+                None,
+            )
+            if not cmd_valid_out:
+                continue
+
+            ready_in = next(
+                (
+                    candidate for candidate in (
+                        f"{prefix}_cmd_ready",
+                        f"{prefix}_ready",
+                        f"{prefix}_tready",
+                    )
+                    if candidate in input_by_name
+                ),
+                None,
+            )
+
+            payload_inputs = sorted(
+                (
+                    p for p in regular_inputs
+                    if p['name'].startswith(f"{prefix}_rsp_payload_")
+                ),
+                key=lambda p: p['name'],
+            )
+
+            iface_id = unique_iface_id(prefix)
+            response_ifaces.append({
+                "id": iface_id,
+                "prefix": prefix,
+                "cmd_valid_out": cmd_valid_out,
+                "ready_in": ready_in,
+                "rsp_valid_in": name,
+                "payload_inputs": payload_inputs,
+            })
+            controlled_inputs.add(name)
+            if ready_in:
+                controlled_inputs.add(ready_in)
+            for payload in payload_inputs:
+                controlled_inputs.add(payload['name'])
+
+        # Detect simple sink-style request/streaming interfaces where the DUT
+        # exposes a ready output and expects the testbench to drive valid/data.
+        for port in regular_inputs:
+            name = port['name']
+            if name in controlled_inputs:
+                continue
+
+            ready_out = None
+            payload_inputs = []
+            valid_in = None
+
+            if name.endswith('_cmd_valid'):
+                prefix = name[:-len('_cmd_valid')]
+                ready_out = f"{prefix}_cmd_ready"
+                if ready_out in output_by_name:
+                    valid_in = name
+                    payload_inputs = sorted(
+                        (
+                            p for p in regular_inputs
+                            if p['name'].startswith(f"{prefix}_cmd_payload_")
+                        ),
+                        key=lambda p: p['name'],
+                    )
+            elif name.endswith('_tvalid'):
+                prefix = name[:-len('_tvalid')]
+                ready_out = f"{prefix}_tready"
+                if ready_out in output_by_name:
+                    valid_in = name
+                    payload_names = [
+                        f"{prefix}_tdata",
+                        f"{prefix}_tkeep",
+                        f"{prefix}_tstrb",
+                        f"{prefix}_tlast",
+                        f"{prefix}_tuser",
+                    ]
+                    payload_inputs = [input_by_name[pn] for pn in payload_names if pn in input_by_name]
+
+            if not valid_in or not ready_out:
+                continue
+
+            iface_id = unique_iface_id(prefix)
+            request_ifaces.append({
+                "id": iface_id,
+                "prefix": prefix,
+                "ready_out": ready_out,
+                "valid_in": valid_in,
+                "payload_inputs": payload_inputs,
+            })
+            controlled_inputs.add(valid_in)
+            for payload in payload_inputs:
+                controlled_inputs.add(payload['name'])
+
+        # Any remaining ready-style input gets a high-bias driver if the DUT
+        # has a matching valid output. This helps generic valid/ready sources.
+        for port in regular_inputs:
+            name = port['name']
+            if name in controlled_inputs:
+                continue
+            match = re.match(r'^(.*)_(cmd_)?ready$', name)
+            if not match:
+                continue
+            prefix = match.group(1)
+            candidate_outputs = [
+                f"{prefix}_cmd_valid",
+                f"{prefix}_valid",
+                f"{prefix}_tvalid",
+            ]
+            if any(candidate in output_by_name for candidate in candidate_outputs):
+                ready_bias_inputs.append(name)
+                controlled_inputs.add(name)
+
+        # Detect simple HLS-style control interfaces (ap_ctrl_hs) and drive
+        # them transactionally. Randomly toggling ap_start and mutating all
+        # memory/data inputs every cycle can leave these designs mostly idle
+        # or hide latency differences on result-side ports.
+        ap_start_in = input_by_name.get("ap_start")
+        if ap_start_in:
+            ap_done_out = "ap_done" if "ap_done" in output_by_name else None
+            ap_idle_out = "ap_idle" if "ap_idle" in output_by_name else None
+            ap_ready_out = "ap_ready" if "ap_ready" in output_by_name else None
+            if ap_done_out or ap_idle_out or ap_ready_out:
+                stable_inputs = [
+                    p for p in regular_inputs
+                    if p['name'] not in controlled_inputs and p['name'] != ap_start_in['name']
+                ]
+                hls_iface = {
+                    "id": unique_iface_id("hls_ap_ctrl"),
+                    "start_in": ap_start_in['name'],
+                    "done_out": ap_done_out,
+                    "idle_out": ap_idle_out,
+                    "ready_out": ap_ready_out,
+                    "stable_inputs": stable_inputs,
+                }
+                controlled_inputs.add(ap_start_in['name'])
+                for port in stable_inputs:
+                    controlled_inputs.add(port['name'])
+
+        # Skip reactive stimulus if requested — fall back to pure LFSR
+        if self.no_reactive:
+            response_ifaces.clear()
+            request_ifaces.clear()
+            ready_bias_inputs.clear()
+            hls_iface = None
+            controlled_inputs.clear()
+
+        # Build port connections carefully to handle edge cases
+        def build_port_connections(module_suffix=""):
+            """Build port connection string for module instantiation."""
+            connections = []
+            # Clock
+            connections.append(f".{clock}({clock})")
+            # Reset if present
+            if reset:
+                connections.append(f".{reset}({reset})")
+            # Regular inputs
+            for port in regular_inputs:
+                connections.append(f".{port['name']}({port['name']})")
+            # Outputs (with module suffix for golden/revised)
+            for port in outputs:
+                connections.append(f".{port['name']}({module_suffix}{port['name']})")
+            return ',\n        '.join(connections)
+
+        stimulus_expr = "lfsr" if self.stimulus_profile == "random" else "directed_word(cycle_count, lfsr)"
+
+        def generate_fallback_random_assignments() -> str:
+            """Generate profile stimulus for inputs not covered by a reactive driver."""
+            stim_lines = []
+            lfsr_bit_index = 0
+            for port in regular_inputs:
+                if port['name'] in controlled_inputs:
+                    continue
+                name = port['name']
+                bits = port_bit_width(port)
+                if bits == 1:
+                    if self.stimulus_profile == "random":
+                        bit_expr = f"lfsr[{lfsr_bit_index % 32}]"
+                    else:
+                        bit_expr = f"(directed_word(cycle_count, lfsr) >> {lfsr_bit_index % 32})"
+                    stim_lines.append(f"            {name} = {bit_expr};")
+                    lfsr_bit_index += 1
+                elif bits <= 32:
+                    stim_lines.append(f"            {name} = {stimulus_expr};")
+                else:
+                    stim_lines.append(assign_from_seed(port, stimulus_expr))
+            return '\n'.join(stim_lines) if stim_lines else '            // No fallback-random inputs'
+
+        def generate_env_declarations() -> str:
+            decls = []
+            for iface in response_ifaces:
+                iface_id = iface['id']
+                decls.append(f"    reg env_{iface_id}_pending;")
+                decls.append(f"    integer env_{iface_id}_delay;")
+                decls.append(f"    reg [31:0] env_{iface_id}_seed;")
+            if hls_iface:
+                iface_id = hls_iface['id']
+                decls.append(f"    reg env_{iface_id}_active;")
+                decls.append(f"    reg env_{iface_id}_launch;")
+                decls.append(f"    integer env_{iface_id}_cycles;")
+                decls.append(f"    reg [31:0] env_{iface_id}_seed;")
+            return '\n'.join(decls) if decls else '    // No reactive environment state'
+
+        def generate_env_init_code() -> str:
+            lines = []
+            for iface in response_ifaces:
+                iface_id = iface['id']
+                lines.append(f"        env_{iface_id}_pending = 0;")
+                lines.append(f"        env_{iface_id}_delay = 0;")
+                lines.append(f"        env_{iface_id}_seed = lfsr ^ 32'h{(0x13579BDF ^ (len(iface_id) * 0x1021)) & 0xFFFFFFFF:08X};")
+            if hls_iface:
+                iface_id = hls_iface['id']
+                lines.append(f"        env_{iface_id}_active = 0;")
+                lines.append(f"        env_{iface_id}_launch = 0;")
+                lines.append(f"        env_{iface_id}_cycles = 0;")
+                lines.append(f"        env_{iface_id}_seed = lfsr ^ 32'h2468ACE1;")
+            return '\n'.join(lines) if lines else '        // No reactive environment state to initialize'
+
+        def generate_negedge_stimulus_code() -> str:
+            lines = []
+
+            for iface in response_ifaces:
+                iface_id = iface['id']
+                ready_in = iface['ready_in']
+                rsp_valid_in = iface['rsp_valid_in']
+
+                lines.append(f"            // Reactive responder for {iface['prefix']}")
+                if ready_in:
+                    lines.append(f"            if (env_{iface_id}_pending) begin")
+                    lines.append(f"                {ready_in} = 0;")
+                    lines.append("            end else begin")
+                    lines.append(f"                {ready_in} = 1;")
+                    lines.append("            end")
+
+                lines.append(f"            if (env_{iface_id}_pending && env_{iface_id}_delay == 0) begin")
+                lines.append(f"                {rsp_valid_in} = 1;")
+                for payload in iface['payload_inputs']:
+                    payload_name = payload['name']
+                    if payload_name.endswith('_error'):
+                        lines.append(f"                {payload_name} = 0;")
+                    elif payload_name.endswith('_last'):
+                        lines.append(f"                {payload_name} = 1;")
+                    else:
+                        lines.append(assign_from_seed(payload, f"env_{iface_id}_seed", indent="                "))
+                lines.append("            end else begin")
+                lines.append(f"                {rsp_valid_in} = 0;")
+                for payload in iface['payload_inputs']:
+                    payload_name = payload['name']
+                    lines.append(f"                {payload_name} = 0;")
+                lines.append("            end")
+
+            for iface in request_ifaces:
+                ready_expr = f"golden_{iface['ready_out']}"
+                lines.append(f"            // Reactive request driver for {iface['prefix']}")
+                lines.append(f"            if ({ready_expr}) begin")
+                lines.append(f"                {iface['valid_in']} = 1;")
+                for payload in iface['payload_inputs']:
+                    payload_name = payload['name']
+                    if payload_name.endswith('_last'):
+                        lines.append(f"                {payload_name} = 1;")
+                    else:
+                        lines.append(assign_from_seed(payload, stimulus_expr, indent="                "))
+                lines.append("            end else begin")
+                lines.append(f"                {iface['valid_in']} = lfsr[0];")
+                for payload in iface['payload_inputs']:
+                    payload_name = payload['name']
+                    if payload_name.endswith('_last'):
+                        lines.append(f"                {payload_name} = 0;")
+                    else:
+                        lines.append(assign_from_seed(payload, stimulus_expr, indent="                "))
+                lines.append("            end")
+
+            for ready_name in ready_bias_inputs:
+                lines.append(f"            {ready_name} = 1;")
+
+            if hls_iface:
+                iface_id = hls_iface['id']
+                start_in = hls_iface['start_in']
+                stable_inputs = hls_iface['stable_inputs']
+                lines.append("            // Transactional HLS control driver")
+                lines.append(f"            if (env_{iface_id}_launch) begin")
+                lines.append(f"                {start_in} = 1;")
+                for idx, port in enumerate(stable_inputs):
+                    seed_expr = f"(env_{iface_id}_seed ^ 32'h{(0x10203040 ^ (idx * 0x1F123BB5)) & 0xFFFFFFFF:08X})"
+                    lines.append(assign_from_seed(port, seed_expr, indent="                "))
+                lines.append("            end else if (env_{0}_active) begin".format(iface_id))
+                lines.append(f"                {start_in} = 0;")
+                for idx, port in enumerate(stable_inputs):
+                    seed_expr = f"(env_{iface_id}_seed ^ 32'h{(0x10203040 ^ (idx * 0x1F123BB5)) & 0xFFFFFFFF:08X})"
+                    lines.append(assign_from_seed(port, seed_expr, indent="                "))
+                lines.append("            end else begin")
+                lines.append(f"                {start_in} = 0;")
+                for port in stable_inputs:
+                    lines.append(f"                {port['name']} = 0;")
+                lines.append("            end")
+
+            lines.append(generate_fallback_random_assignments())
+            return '\n'.join(lines)
+
+        def generate_posedge_bookkeeping_code() -> str:
+            lines = []
+            for idx, iface in enumerate(response_ifaces):
+                iface_id = iface['id']
+                cmd_valid_out = f"golden_{iface['cmd_valid_out']}"
+                ready_gate = iface['ready_in'] if iface['ready_in'] else "1'b1"
+                seed_mask = (0x9E3779B9 ^ (idx * 0x45D9F3B)) & 0xFFFFFFFF
+                lines.append(f"            if (env_{iface_id}_pending) begin")
+                lines.append(f"                if (env_{iface_id}_delay > 0) begin")
+                lines.append(f"                    env_{iface_id}_delay = env_{iface_id}_delay - 1;")
+                lines.append("                end else begin")
+                lines.append(f"                    env_{iface_id}_pending = 0;")
+                lines.append("                end")
+                lines.append(f"            end else if ({cmd_valid_out} && {ready_gate}) begin")
+                lines.append(f"                env_{iface_id}_pending = 1;")
+                lines.append(f"                env_{iface_id}_delay = lfsr[0];")
+                lines.append(f"                env_{iface_id}_seed = lfsr ^ 32'h{seed_mask:08X};")
+                lines.append("            end")
+            if hls_iface:
+                iface_id = hls_iface['id']
+                done_expr = f"golden_{hls_iface['done_out']}" if hls_iface['done_out'] else "1'b0"
+                idle_expr = f"golden_{hls_iface['idle_out']}" if hls_iface['idle_out'] else "1'b0"
+                ready_expr = f"golden_{hls_iface['ready_out']}" if hls_iface['ready_out'] else "1'b0"
+                launch_condition = f"({idle_expr} || {ready_expr})"
+                lines.append(f"            if (env_{iface_id}_launch) begin")
+                lines.append(f"                env_{iface_id}_launch = 0;")
+                lines.append(f"                env_{iface_id}_cycles = 1;")
+                lines.append(f"            end else if (env_{iface_id}_active) begin")
+                lines.append(f"                env_{iface_id}_cycles = env_{iface_id}_cycles + 1;")
+                lines.append(f"                if ({done_expr} || (({ready_expr}) && env_{iface_id}_cycles > 1)) begin")
+                lines.append(f"                    env_{iface_id}_active = 0;")
+                lines.append(f"                    env_{iface_id}_cycles = 0;")
+                lines.append("                end")
+                lines.append(f"            end else if ({launch_condition}) begin")
+                lines.append(f"                env_{iface_id}_active = 1;")
+                lines.append(f"                env_{iface_id}_launch = 1;")
+                lines.append(f"                env_{iface_id}_cycles = 0;")
+                lines.append(f"                env_{iface_id}_seed = lfsr ^ 32'hA5A55A5A;")
+                lines.append("            end")
+            return '\n'.join(lines) if lines else '            // No reactive bookkeeping required'
+
+        def generate_protocol_compare_code() -> str:
+            protocol_outputs = []
+            seen_protocol_outputs = set()
+
+            def add_protocol_output(name: Optional[str]):
+                if name and name in output_by_name and name not in seen_protocol_outputs:
+                    seen_protocol_outputs.add(name)
+                    protocol_outputs.append(name)
+
+            for iface in response_ifaces:
+                add_protocol_output(iface['cmd_valid_out'])
+            for iface in request_ifaces:
+                add_protocol_output(iface['ready_out'])
+            if hls_iface:
+                add_protocol_output(hls_iface['done_out'])
+                add_protocol_output(hls_iface['idle_out'])
+                add_protocol_output(hls_iface['ready_out'])
+
+            lines = []
+            for name in protocol_outputs:
+                lines.append(f'''
+            if (golden_{name} !== revised_{name}) begin
+                $display("PROTOCOL MISMATCH at cycle %0d: {name} golden=%h revised=%h", cycle_count, golden_{name}, revised_{name});
+                protocol_mismatch_count = protocol_mismatch_count + 1;
+            end''')
+            return '\n'.join(lines) if lines else '            // No protocol outputs to compare'
+
+        self.interface_audit = {
+            "module": golden_module,
+            "clock_ports": [port["name"] for port in clocks],
+            "reset_ports": [port["name"] for port in resets],
+            "response_interfaces": response_ifaces,
+            "request_interfaces": request_ifaces,
+            "ready_bias_inputs": ready_bias_inputs,
+            "hls_interface": hls_iface,
+            "fallback_input_names": [
+                port["name"] for port in regular_inputs
+                if port["name"] not in controlled_inputs
+            ],
+            "stimulus_profile": self.stimulus_profile,
+            "reactive_enabled": not self.no_reactive,
+        }
+
+        # Generate testbench
+        compare_body = chr(10).join(f'''
+            if (golden_{port['name']} !== revised_{port['name']}) begin
+                $display("MISMATCH at cycle %0d: {port['name']} golden=%h revised=%h", cycle_count, golden_{port['name']}, revised_{port['name']});
+                mismatch_count = mismatch_count + 1;
+            end''' for port in outputs) if outputs else '            // No outputs to compare'
+
+        tb_content = f"""
+`timescale 1ns / 1ps
+
+module testbench;
+
+    // Clock and reset
+    reg {clock};
+    {'reg ' + reset + ';' if reset else ''}
+
+    // Inputs (driven by LFSR)
+    {chr(10).join(f"    reg {port['width']+' ' if port['width'] else ''}{port['name']};" for port in regular_inputs) if regular_inputs else '    // No regular inputs'}
+
+    // Outputs from both designs
+    {chr(10).join(f"    wire {port['width']+' ' if port['width'] else ''}golden_{port['name']};" for port in outputs) if outputs else '    // No outputs to compare'}
+    {chr(10).join(f"    wire {port['width']+' ' if port['width'] else ''}revised_{port['name']};" for port in outputs) if outputs else ''}
+
+    // LFSR for pseudo-random input generation
+    reg [31:0] lfsr;
+
+    // Reactive environment state
+{generate_env_declarations()}
+
+    // Instantiate golden design
+    {golden_module} golden_dut (
+        {build_port_connections("golden_")}
+    );
+
+    // Instantiate revised design
+    {revised_module} revised_dut (
+        {build_port_connections("revised_")}
+    );
+
+    // Clock generation from the frozen DCP clock contract.
+    initial begin
+        {clock} = 0;
+        forever #{clock_period_ns / 2.0:.6f} {clock} = ~{clock};
+    end
+
+    // LFSR update function
+    function [31:0] lfsr_next;
+        input [31:0] lfsr_in;
+        begin
+            lfsr_next = {{lfsr_in[30:0], lfsr_in[31] ^ lfsr_in[21] ^ lfsr_in[1] ^ lfsr_in[0]}};
+        end
+    endfunction
+
+    // Deterministic boundary-oriented words for the directed profile.
+    function [31:0] directed_word;
+        input integer vector_index;
+        input [31:0] seed_word;
+        begin
+            case ((vector_index / 32) % 6)
+                0: directed_word = 32'h00000000;
+                1: directed_word = 32'hFFFFFFFF;
+                2: directed_word = 32'hAAAAAAAA;
+                3: directed_word = 32'h55555555;
+                4: directed_word = (32'h1 << (vector_index % 32));
+                default: directed_word = ~(32'h1 << (vector_index % 32));
+            endcase
+            directed_word = directed_word ^ seed_word;
+        end
+    endfunction
+
+    // Test stimulus and checking
+    integer mismatch_count;
+    integer protocol_mismatch_count;
+    integer cycle_count;
+    integer num_vectors;
+
+    initial begin
+        mismatch_count = 0;
+        protocol_mismatch_count = 0;
+        cycle_count = 0;
+        lfsr = 32'h{self.stimulus_seeds[0]:08X};
+        if (!$value$plusargs("TEST_SEED=%h", lfsr)) begin
+            lfsr = 32'h{self.stimulus_seeds[0]:08X};
+        end
+        num_vectors = {self.num_vectors};
+        if (!$value$plusargs("NUM_VECTORS=%d", num_vectors)) begin
+            num_vectors = {self.num_vectors};
+        end
+        $display("Configured test vectors: %0d", num_vectors);
+        $display("Configured stimulus seed: 0x%08h", lfsr);
+{generate_env_init_code()}
+
+        // Reset
+        {''+reset+' = 1;' if reset else ''}
+        {chr(10).join(f"        {port['name']} = 0;" for port in regular_inputs)}
+        repeat(10) @(posedge {clock});
+        {''+reset+' = 0;' if reset else ''}
+
+        // Warm-up period: fill pipeline without checking outputs.
+        // Drive inputs on the inactive edge so sequential logic sees stable
+        // values before the active clock edge.
+        repeat(50) begin
+            @(negedge {clock});
+            lfsr = lfsr_next(lfsr);
+{generate_negedge_stimulus_code()}
+            @(posedge {clock});
+{generate_posedge_bookkeeping_code()}
+            #1;
+{generate_protocol_compare_code()}
+        end
+
+        // Run test vectors with output checking
+        repeat(num_vectors) begin
+            // Generate new inputs from LFSR
+            @(negedge {clock});
+            lfsr = lfsr_next(lfsr);
+{generate_negedge_stimulus_code()}
+
+            // Sample outputs on the following active edge
+            @(posedge {clock});
+            cycle_count = cycle_count + 1;
+{generate_posedge_bookkeeping_code()}
+
+            // Check outputs after settling
+            #1; // Small delay for output settling
+
+            // Compare all outputs
+{compare_body}
+
+            // Compare protocol outputs that drive the reactive environment
+{generate_protocol_compare_code()}
+        end
+
+        // Report results
+        $display("\\n=======================================");
+        $display("SIMULATION COMPLETE");
+        $display("=======================================");
+        $display("Cycles simulated: %0d", cycle_count);
+        {'$display("Outputs compared: 0 (design has no outputs)");' if not outputs else '$display("Mismatches found: %0d", mismatch_count);'}
+        $display("Protocol mismatches found: %0d", protocol_mismatch_count);
+        if (mismatch_count == 0 && protocol_mismatch_count == 0) begin
+            {'$display("Result: PASS (no crashes detected)");' if not outputs else '$display("Result: PASS");'}
+            $finish(0);
+        end else begin
+            $display("Result: FAIL");
+            $finish(1);
+        end
+    end
+
+    // Timeout watchdog (reset + warmup + test cycles, with 2x safety margin)
+    initial begin
+        #1;
+        #((10 + 50 + num_vectors) * {clock_period_ns * 2.0:.6f}) $display("ERROR: Simulation timeout"); $finish(2);
+    end
+
+endmodule
+"""
+
+        with open(tb_path, 'w') as f:
+            f.write(tb_content)
+
+        logger.info(f"Generated testbench: {tb_path}")
+
+    async def phase2_functional_simulation(self) -> bool:
+        """Phase 2: Functional simulation comparison."""
+        print("\n" + "="*70)
+        print("PHASE 2: FUNCTIONAL SIMULATION")
+        print("="*70)
+
+        # Export Verilog simulation models
+        golden_v = self.temp_dir / "golden_sim.v"
+        revised_v = self.temp_dir / "revised_sim.v"
+
+        print("\nExporting simulation models...")
+
+        # Open golden DCP
+        logger.info(f"Opening golden DCP: {self.golden_dcp}")
+        result = await self.vivado_session.call_tool("open_checkpoint", {
+            "dcp_path": str(self.golden_dcp.resolve())
+        })
+
+        # Export golden as Verilog
+        logger.info("Exporting golden to Verilog...")
+        result = await self.vivado_session.call_tool("write_verilog_simulation", {
+            "verilog_path": str(golden_v),
+            "force": True
+        })
+        print(f"✓ Golden model exported: {golden_v.name}")
+
+        # Query clock ports while the golden design is still loaded - more
+        # robust than guessing from Verilog port names downstream.
+        golden_clocks = await self._query_clock_ports_from_vivado()
+        self.clock_period_ns = await self._query_clock_period_ns_from_vivado()
+        if golden_clocks:
+            logger.info(f"Vivado reports golden clock ports: {golden_clocks}")
+        else:
+            logger.info("Vivado reported no clocks for golden design (will fall back to name heuristic)")
+
+        # Open revised DCP
+        logger.info(f"Opening revised DCP: {self.revised_dcp}")
+        result = await self.vivado_session.call_tool("open_checkpoint", {
+            "dcp_path": str(self.revised_dcp.resolve())
+        })
+
+        # Export revised as Verilog
+        logger.info("Exporting revised to Verilog...")
+        result = await self.vivado_session.call_tool("write_verilog_simulation", {
+            "verilog_path": str(revised_v),
+            "force": True
+        })
+        print(f"✓ Revised model exported: {revised_v.name}")
+
+        # Query clock ports for the revised design as well, mainly so we can
+        # detect mismatches that would invalidate the testbench (the testbench
+        # is built from golden's port list, but revised must agree).
+        revised_clocks = await self._query_clock_ports_from_vivado()
+        if revised_clocks:
+            logger.info(f"Vivado reports revised clock ports: {revised_clocks}")
+        if golden_clocks and revised_clocks and set(golden_clocks) != set(revised_clocks):
+            logger.warning(
+                f"Clock port set differs between golden ({sorted(golden_clocks)}) "
+                f"and revised ({sorted(revised_clocks)}); using golden's"
+            )
+
+        # Parse design information
+        print("\nParsing design information...")
+        golden_info = self.get_design_info_from_verilog(golden_v)
+        revised_info = self.get_design_info_from_verilog(revised_v)
+
+        sim_golden_v = golden_v
+        sim_revised_v = revised_v
+        if self.simulation_mode == "timing":
+            golden_timesim = self.temp_dir / "golden_timesim.v"
+            revised_timesim = self.temp_dir / "revised_timesim.v"
+            golden_sdf = self.temp_dir / "golden_timesim.sdf"
+            revised_sdf = self.temp_dir / "revised_timesim.sdf"
+
+            async def export_timesim(dcp: Path, netlist: Path, sdf: Path, top: str):
+                await self.vivado_session.call_tool(
+                    "open_checkpoint", {"dcp_path": str(dcp.resolve())}
+                )
+                command = (
+                    f"write_sdf -force -mode timesim -process_corner slow {{{sdf}}}; "
+                    f"write_verilog -force -mode timesim -rename_top {top} "
+                    f"-sdf_anno true -sdf_file {{{sdf}}} {{{netlist}}}"
+                )
+                response = await self.vivado_session.call_tool(
+                    "run_tcl", {"command": command, "timeout": 1800}
+                )
+                response_text = "\n".join(
+                    item.text for item in response.content if hasattr(item, "text")
+                )
+                if not netlist.is_file() or not sdf.is_file():
+                    raise RuntimeError(
+                        f"timesim export did not produce netlist/SDF: {response_text[-1000:]}"
+                    )
+
+            await export_timesim(
+                self.golden_dcp, golden_timesim, golden_sdf, "golden_timesim_top"
+            )
+            await export_timesim(
+                self.revised_dcp,
+                revised_timesim,
+                revised_sdf,
+                "revised_timesim_top_revised",
+            )
+            sim_golden_v = golden_timesim
+            sim_revised_v = revised_timesim
+            golden_info["module_name"] = "golden_timesim_top"
+            revised_info["module_name"] = "revised_timesim_top"
+
+        print(f"Golden module: {golden_info['module_name']}")
+        print(f"Revised module: {revised_info['module_name']}")
+
+        # Show port details with bit widths
+        print(f"\nPort Information:")
+        print(f"  Inputs ({len(golden_info['ports']['inputs'])}):")
+        for port in golden_info['ports']['inputs']:
+            width_str = f" {port['width']}" if port['width'] else ""
+            print(f"    - {port['name']}{width_str}")
+        print(f"  Outputs ({len(golden_info['ports']['outputs'])}):")
+        for port in golden_info['ports']['outputs']:
+            width_str = f" {port['width']}" if port['width'] else ""
+            print(f"    - {port['name']}{width_str}")
+
+        # Generate testbench
+        tb_path = self.temp_dir / "testbench.v"
+        print(f"\nGenerating testbench ({self.num_vectors} random vectors)...")
+        self.generate_testbench(
+            golden_info, revised_info, tb_path,
+            clock_names=golden_clocks,
+            clock_period_ns=self.clock_period_ns,
+        )
+        print(f"✓ Testbench generated: {tb_path.name}")
+
+        # Run xsim simulation
+        print("\nRunning xsim simulation...")
+        print("(This may take a few minutes...)")
+
+        xsim_dir = self.temp_dir / "xsim_work"
+        xsim_dir.mkdir(exist_ok=True)
+
+        current_step = "setup"
+        try:
+            # Get Vivado installation path for simulation libraries
+            # Check VIVADO_EXEC environment variable first, then PATH
+            vivado_path = os.environ.get("VIVADO_EXEC")
+            if vivado_path:
+                # If VIVADO_EXEC is just the name (not a path), search in PATH
+                if '/' not in vivado_path:
+                    vivado_path = shutil.which(vivado_path)
+            else:
+                vivado_path = shutil.which("vivado")
+            if not vivado_path:
+                raise RuntimeError("Vivado not found in PATH. Set VIVADO_EXEC env var or add Vivado to PATH.")
+
+            # Vivado sim lib is at: $XILINX_VIVADO/data/verilog/src/
+            vivado_bin_dir = Path(vivado_path).parent
+            vivado_install = vivado_bin_dir.parent
+            unisim_dir = vivado_install / "data" / "verilog" / "src"
+
+            if not unisim_dir.exists():
+                logger.warning(f"UNISIM library not found at {unisim_dir}, trying glbl.v only")
+
+            # To avoid module name conflicts, rename ALL modules in revised file
+            # (both declarations AND instantiations of those modules) so that the
+            # renamed-revised top is a self-contained design that doesn't silently
+            # link against golden sub-modules at elaboration time.
+            logger.info("Preparing revised simulation netlist...")
+            revised_renamed = xsim_dir / "revised_sim_renamed.v"
+
+            with open(sim_revised_v, 'r') as f:
+                content = f.read()
+
+            revised_module_name = revised_info["module_name"]
+            revised_module_renamed = f"{revised_module_name}_revised"
+
+            # Pass 1: collect every declared module name in the revised netlist.
+            # Vivado's funcsim output is regular: each declaration starts with
+            # "module <name>" at the start of a line.
+            declared_module_names = set(re.findall(
+                r'(?m)^\s*module\s+(\w+)\b',
+                content
+            ))
+            logger.info(
+                f"Found {len(declared_module_names)} module declarations in revised netlist"
+            )
+
+            # Pass 2: per-line scan rewriting both declarations and instantiations
+            # of declared modules to use the "_revised" suffix. We use a per-line
+            # scan with set-membership lookups (O(file size)) rather than a giant
+            # alternation regex, which is intractably slow on big benchmarks
+            # (e.g. corescore_500_mod has ~6700 user modules in a 71 MB netlist).
+            #
+            # Lines we care about in Vivado funcsim output:
+            #   "  module NAME"               -> declaration to rename
+            #   "  NAME inst_name (..."       -> instantiation to rename
+            # Anything else (port lists, assigns, wires, comments, primitives
+            # like LUT6/FDRE which are NOT in declared_module_names) is left alone.
+            if declared_module_names and self.simulation_mode == "functional":
+                renamed_lines = []
+                suffix = "_revised"
+                for line in content.splitlines(keepends=True):
+                    s = line.lstrip()
+                    if not s:
+                        renamed_lines.append(line); continue
+                    sp = s.find(' ')
+                    tab = s.find('\t')
+                    if tab != -1 and (sp == -1 or tab < sp):
+                        sp = tab
+                    if sp == -1:
+                        renamed_lines.append(line); continue
+                    first = s[:sp]
+                    if first == 'module':
+                        rest = s[sp:].lstrip()
+                        nm = re.match(r'(\w+)', rest)
+                        if nm and nm.group(1) in declared_module_names:
+                            name = nm.group(1)
+                            indent = line[:len(line) - len(s)]
+                            after_name = len(s) - len(rest) + len(name)
+                            renamed_lines.append(
+                                indent + 'module ' + name + suffix + s[after_name:]
+                            )
+                            continue
+                    elif first in declared_module_names:
+                        indent = line[:len(line) - len(s)]
+                        renamed_lines.append(
+                            indent + first + suffix + s[len(first):]
+                        )
+                        continue
+                    renamed_lines.append(line)
+                content = ''.join(renamed_lines)
+
+            with open(revised_renamed, 'w') as f:
+                f.write(content)
+
+            # Compile Verilog files
+            logger.info("Compiling with xvlog...")
+            compile_cmd = [
+                "xvlog",
+                "-work", "work",
+                str(sim_golden_v),
+                str(revised_renamed),
+                str(tb_path)
+            ]
+
+            # Add UNISIM glbl if available
+            if unisim_dir.exists():
+                glbl_v = unisim_dir / "glbl.v"
+                if glbl_v.exists():
+                    compile_cmd.insert(3, str(glbl_v))
+
+            # Timeouts are generous because large benchmarks (e.g. corescore_500_mod
+            # with thousands of user modules) can take many minutes per step.
+            # xvlog/xelab times scale with design size; xsim time scales with both
+            # design size and num_vectors.
+            xvlog_timeout_s = 1800   # 30 min
+            xelab_timeout_s = 3600   # 60 min - elaborates both designs
+            # xsim: per-cycle cost is roughly proportional to the number of
+            # primitive cells. Two copies of a 100k-LUT design (e.g.
+            # corescore_500_mod) measured ~0.3s/cycle. We add a generous baseline
+            # for kernel init and cap below by 60 min so small designs still get
+            # a comfortable budget.
+            def xsim_timeout_for(vector_count: int) -> int:
+                return max(3600, 600 + int(vector_count * 1.0))
+
+            current_step = "xvlog (compilation)"
+            result = subprocess.run(
+                compile_cmd,
+                cwd=xsim_dir,
+                capture_output=True,
+                text=True,
+                timeout=xvlog_timeout_s
+            )
+
+            if result.returncode != 0:
+                print(f"\n✗ Compilation failed:")
+                print(result.stdout)
+                print(result.stderr)
+                return False
+
+            print("✓ Compilation successful")
+
+            # Elaborate with UNISIM library reference.
+            #
+            # We pass "--debug off" because the testbench reports results via
+            # $display; we never inspect waveforms, so the per-signal debug
+            # instrumentation that "-debug typical" enables is pure overhead
+            # (relevant for smaller benchmarks where it dominates).
+            #
+            # "--mt auto" lets xelab parallelise where it can; it is a no-op for
+            # the per-module compile loop on huge designs but doesn't hurt.
+            logger.info("Elaborating with xelab...")
+            elab_cmd = [
+                "xelab",
+                "--debug", "off",
+                "--mt", "auto",
+                "-L", "unisims_ver",  # Link against UNISIM library
+                "-L", "unimacro_ver",
+                "work.testbench",  # Specify library.module
+                "work.glbl",       # Include glbl for initialization
+                "-s", "testbench_sim"
+            ]
+
+            current_step = "xelab (elaboration)"
+            result = subprocess.run(
+                elab_cmd,
+                cwd=xsim_dir,
+                capture_output=True,
+                text=True,
+                timeout=xelab_timeout_s
+            )
+
+            if result.returncode != 0:
+                # Check if failure is due to encrypted/SIP IP
+                error_output = result.stdout + result.stderr
+                if self._is_encrypted_ip_error(error_output):
+                    logger.info("Elaboration failed due to encrypted/SIP IP")
+                    print("\n" + "="*70)
+                    print("⚠ PHASE 2 SKIPPED")
+                    print("="*70)
+                    print("\nReason: Design contains encrypted or Secure IP blocks")
+                    print("        (e.g., PCIe, GTY transceivers) that cannot be")
+                    print("        simulated without vendor-specific libraries.")
+                    print("\nStructural checks (Phase 1) are still valid.")
+                    print("="*70 + "\n")
+                    return {
+                        "status": "skipped",
+                        "reason": "Design contains encrypted or Secure IP blocks",
+                        "details": "xelab elaboration failed due to missing SIP modules"
+                    }
+
+                print(f"\n✗ Elaboration failed:")
+                print(result.stdout)
+                print(result.stderr)
+                return False
+
+            print("✓ Elaboration successful")
+
+            def run_xsim(vector_count: int, label: str, seed: int) -> dict:
+                logger.info(f"Running {label} simulation with xsim ({vector_count} vectors)...")
+                print(f"\nSimulating {vector_count} test vectors ({label})...")
+
+                sim_cmd = [
+                    "xsim",
+                    "testbench_sim",
+                    "-R",
+                    "--testplusarg", f"NUM_VECTORS={vector_count}",
+                    "--testplusarg", f"TEST_SEED={seed:08X}",
+                ]
+
+                result = subprocess.run(
+                    sim_cmd,
+                    cwd=xsim_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=xsim_timeout_for(vector_count)
+                )
+
+                sim_output = result.stdout + result.stderr
+                log_file = self.temp_dir / f"simulation_{label}.log"
+                with open(log_file, 'w') as f:
+                    f.write(sim_output)
+
+                if label == "full" or label == "full_seed_00":
+                    final_log = self.temp_dir / "simulation.log"
+                    with open(final_log, 'w') as f:
+                        f.write(sim_output)
+
+                parse_result = parse_simulation_output(
+                    sim_output,
+                    result.returncode,
+                    vector_count,
+                )
+
+                for line in sim_output.split('\n'):
+                    if 'MISMATCH' in line:
+                        print(f"  {line}")
+
+                report = {
+                    "vectors_requested": vector_count,
+                    "stimulus_seed": seed,
+                    "stimulus_seed_hex": f"0x{seed:08X}",
+                    "cycles_simulated": parse_result["cycles_simulated"],
+                    "mismatch_count": parse_result["mismatch_count"],
+                    "protocol_mismatch_count": parse_result["protocol_mismatch_count"],
+                    "log_file": str(log_file),
+                    "result_pass_seen": parse_result["result_pass_seen"],
+                    "result_fail_seen": parse_result["result_fail_seen"],
+                    "simulator_failed": parse_result["simulator_failed"],
+                    "infrastructure_failure": parse_result["infrastructure_failure"],
+                    "infrastructure_reason": parse_result["infrastructure_reason"],
+                    "returncode": parse_result["returncode"],
+                    "passed": parse_result["passed"],
+                }
+
+                print("\n" + "-"*70)
+                print(f"Simulation Results ({label}):")
+                print(f"  Requested vectors: {vector_count}")
+                print(f"  Cycles: {parse_result['cycles_simulated']}")
+                print(f"  Mismatches: {parse_result['mismatch_count']}")
+                print(f"  Protocol mismatches: {parse_result['protocol_mismatch_count']}")
+                print(f"  Log: {log_file}")
+                if parse_result["simulator_failed"]:
+                    print("  Simulator reported an internal failure")
+                if not parse_result["result_pass_seen"] and result.returncode == 0:
+                    print("  Testbench PASS marker not found")
+                print(f"  Result: {'PASSED' if parse_result['passed'] else 'FAILED'}")
+                print("-"*70)
+
+                return report
+
+            current_step = "xsim (precheck simulation)"
+            precheck_report = None
+            run_precheck = (
+                self.precheck_vectors > 0
+                and self.precheck_vectors < self.num_vectors
+            )
+            if run_precheck:
+                precheck_report = run_xsim(
+                    self.precheck_vectors,
+                    "precheck",
+                    self.stimulus_seeds[0],
+                )
+                if not precheck_report["passed"]:
+                    self.simulation_report = {
+                        "precheck_vectors": self.precheck_vectors,
+                        "precheck_passed": False,
+                        "precheck_report": precheck_report,
+                        "full_vectors": self.num_vectors,
+                        "full_run_skipped": True,
+                        "cycles_simulated": precheck_report["cycles_simulated"],
+                        "mismatch_count": precheck_report["mismatch_count"],
+                        "protocol_mismatch_count": precheck_report["protocol_mismatch_count"],
+                        "log_file": precheck_report["log_file"],
+                        "result_pass_seen": precheck_report["result_pass_seen"],
+                        "result_fail_seen": precheck_report["result_fail_seen"],
+                        "simulator_failed": precheck_report["simulator_failed"],
+                        "infrastructure_failure": precheck_report["infrastructure_failure"],
+                        "infrastructure_reason": precheck_report["infrastructure_reason"],
+                        "returncode": precheck_report["returncode"],
+                    }
+                    if precheck_report["infrastructure_failure"]:
+                        self.infrastructure_failure = True
+                        self.infrastructure_reason = precheck_report["infrastructure_reason"]
+                    self.phase2_passed = False
+                    if self.infrastructure_failure:
+                        print("\nPhase 2: INFRASTRUCTURE FAILURE ⊘ (precheck crashed or did not complete; full run skipped)")
+                    else:
+                        print("\nPhase 2: FAILED ✗ (precheck failed; full run skipped)")
+                    return False
+
+            if self.prepare_seed_workspace_only:
+                # WP-015 schedules each full seed as an independent global
+                # queue unit.  Export/compile/elaborate and the common precheck
+                # happen exactly once here; the immutable prepared xsim assets
+                # are cloned into isolated per-seed workspaces by the scheduler.
+                self.seed_workspace_prepared = True
+                self.simulation_report = {
+                    "precheck_vectors": self.precheck_vectors if run_precheck else None,
+                    "precheck_passed": precheck_report["passed"] if precheck_report else None,
+                    "precheck_report": precheck_report,
+                    "full_vectors": self.num_vectors,
+                    "full_run_skipped": True,
+                    "full_run_skip_reason": "WP015_SEED_WORKSPACE_PREPARED",
+                    "prepared_seed_workspace": str(xsim_dir),
+                    "stimulus_seeds": self.stimulus_seeds,
+                    "seed_reports": [],
+                    "seed_reports_complete": False,
+                    "cycles_simulated": precheck_report["cycles_simulated"] if precheck_report else 0,
+                    "mismatch_count": precheck_report["mismatch_count"] if precheck_report else 0,
+                    "protocol_mismatch_count": precheck_report["protocol_mismatch_count"] if precheck_report else 0,
+                    "infrastructure_failure": False,
+                    "infrastructure_reason": None,
+                }
+                self.phase2_passed = False
+                print("\nPhase 2: PREPARED FOR WP-015 SEED SCHEDULER")
+                return False
+
+            current_step = "xsim (full simulation)"
+            seed_reports = []
+            for seed_index, seed in enumerate(self.stimulus_seeds):
+                label = "full" if len(self.stimulus_seeds) == 1 else f"full_seed_{seed_index:02d}"
+                seed_report = run_xsim(self.num_vectors, label, seed)
+                seed_reports.append(seed_report)
+                # A definitive mismatch or an infrastructure failure is a
+                # per-seed terminal. Preserve it and avoid spending further
+                # simulator cycles on seeds that cannot change the aggregate.
+                if not seed_report["passed"]:
+                    break
+            full_report = seed_reports[0]
+            all_seed_reports_complete = len(seed_reports) == len(self.stimulus_seeds)
+            all_seeds_passed = all_seed_reports_complete and all(
+                report["passed"] for report in seed_reports
+            )
+            mismatch_total = sum(int(report["mismatch_count"]) for report in seed_reports)
+            protocol_mismatch_total = sum(
+                int(report["protocol_mismatch_count"]) for report in seed_reports
+            )
+            failing_report = next(
+                (report for report in seed_reports if not report["passed"]),
+                full_report,
+            )
+
+            self.simulation_report = {
+                "precheck_vectors": self.precheck_vectors if run_precheck else None,
+                "precheck_passed": precheck_report["passed"] if precheck_report else None,
+                "precheck_report": precheck_report,
+                "full_vectors": self.num_vectors,
+                "full_report": full_report,
+                "stimulus_seeds": self.stimulus_seeds,
+                "seed_reports": seed_reports,
+                "seed_reports_complete": all_seed_reports_complete,
+                "total_full_cycles_simulated": sum(
+                    int(report["cycles_simulated"]) for report in seed_reports
+                ),
+                # Keep the legacy scalar fields meaningful for callers that
+                # validate one run while exposing complete per-seed evidence.
+                "cycles_simulated": self.num_vectors if all_seeds_passed else failing_report["cycles_simulated"],
+                "mismatch_count": mismatch_total,
+                "protocol_mismatch_count": protocol_mismatch_total,
+                "log_file": str(self.temp_dir / "simulation.log"),
+                "result_pass_seen": all_seeds_passed,
+                "result_fail_seen": any(report["result_fail_seen"] for report in seed_reports),
+                "simulator_failed": any(report["simulator_failed"] for report in seed_reports),
+                "infrastructure_failure": any(report["infrastructure_failure"] for report in seed_reports),
+                "infrastructure_reason": next(
+                    (report["infrastructure_reason"] for report in seed_reports if report["infrastructure_failure"]),
+                    None,
+                ),
+                "returncode": failing_report["returncode"],
+            }
+
+            # Check if passed. xsim can report an internal simulator failure
+            # while still returning 0, so require the testbench's explicit
+            # completion marker and expected cycle count.
+            self.phase2_passed = all_seeds_passed
+            if self.simulation_report["infrastructure_failure"]:
+                self.infrastructure_failure = True
+                self.infrastructure_reason = self.simulation_report["infrastructure_reason"]
+
+            if self.phase2_passed:
+                print("\nPhase 2: PASSED ✓")
+            elif self.infrastructure_failure:
+                print("\nPhase 2: INFRASTRUCTURE FAILURE ⊘")
+            else:
+                print("\nPhase 2: FAILED ✗")
+
+            return self.phase2_passed
+
+        except subprocess.TimeoutExpired as e:
+            timeout_s = getattr(e, "timeout", "?")
+            print(f"\n✗ Timeout in {current_step} after {timeout_s}s")
+            logger.error(
+                f"subprocess.TimeoutExpired in step '{current_step}' "
+                f"(timeout={timeout_s}s)"
+            )
+            self.infrastructure_failure = True
+            self.infrastructure_reason = f"timeout_in_{current_step}"
+            self.simulation_report = {
+                "infrastructure_failure": True,
+                "infrastructure_reason": self.infrastructure_reason,
+                "stage": current_step,
+                "timeout_seconds": timeout_s,
+            }
+            return False
+        except ValidatorIncompatibility as e:
+            print(f"\n✗ Validator incompatibility in {current_step}: {e}")
+            logger.warning("Validator incompatibility in '%s': %s", current_step, e)
+            self.validator_incompatibility = e.terminal
+            self.validator_incompatibility_detail = str(e)
+            self.simulation_report = {
+                "validator_incompatibility": e.terminal,
+                "stage": current_step,
+                "detail": str(e),
+            }
+            return False
+        except Exception as e:
+            print(f"\n✗ Simulation error in {current_step}: {e}")
+            logger.exception(f"Error in step '{current_step}'")
+            self.infrastructure_failure = True
+            self.infrastructure_reason = f"exception_in_{current_step}"
+            self.simulation_report = {
+                "infrastructure_failure": True,
+                "infrastructure_reason": self.infrastructure_reason,
+                "stage": current_step,
+                "error": str(e),
+            }
+            return False
+
+    async def validate(self) -> bool:
+        """Run complete validation (both phases)."""
+        start_time = time.time()
+
+        print("\n" + "="*70)
+        print("DCP EQUIVALENCE VALIDATION")
+        print("="*70)
+        print(f"Golden:  {self.golden_dcp}")
+        print(f"Revised: {self.revised_dcp}")
+        print(f"Vectors: {self.num_vectors}")
+        print("Stimulus seeds: " + ", ".join(f"0x{seed:08X}" for seed in self.stimulus_seeds))
+        print(f"Stimulus profile: {self.stimulus_profile}")
+        if 0 < self.precheck_vectors < self.num_vectors:
+            print(f"Precheck vectors: {self.precheck_vectors}")
+        print("="*70)
+
+        # Phase 1: Structural checks
+        phase1_passed = await self.phase1_structural_checks()
+
+        if not phase1_passed:
+            print("\n⚠ Skipping Phase 2 due to Phase 1 failures")
+            elapsed = time.time() - start_time
+            self.print_final_report(elapsed)
+            return False
+
+        # Phase 2: Functional simulation.  Some incompatibilities (for example
+        # an exported top with zero observable I/O) are discovered before the
+        # simulator setup block's local exception boundary.  Preserve their
+        # typed scientific terminal instead of leaking them to main() as a
+        # generic process failure.
+        try:
+            phase2_result = await self.phase2_functional_simulation()
+        except ValidatorIncompatibility as error:
+            self.validator_incompatibility = error.terminal
+            self.validator_incompatibility_detail = str(error)
+            self.simulation_report = {
+                "validator_incompatibility": error.terminal,
+                "stage": "phase2_pre_simulation",
+                "detail": str(error),
+            }
+            phase2_result = False
+
+        # Handle skipped phase2 (e.g., encrypted IP)
+        if isinstance(phase2_result, dict) and phase2_result.get("status") == "skipped":
+            self.phase2_skipped = True
+            self.phase2_skip_reason = phase2_result.get("reason", "Unknown reason")
+            phase2_passed = bool(phase1_passed)  # Structural-only pass.
+        else:
+            phase2_passed = phase2_result
+
+        elapsed = time.time() - start_time
+        self.print_final_report(elapsed)
+
+        return phase1_passed and phase2_passed
+
+    def print_final_report(self, elapsed_time: float):
+        """Print final validation report."""
+        print("\n" + "="*70)
+        print("VALIDATION SUMMARY")
+        print("="*70)
+        print(f"Golden DCP:  {self.golden_dcp.name}")
+        print(f"Revised DCP: {self.revised_dcp.name}")
+        print(f"Runtime:     {elapsed_time:.1f} seconds ({elapsed_time/60:.1f} minutes)")
+        print()
+
+        print("Phase 1 (Structural): " + ("PASSED ✓" if self.phase1_passed else "FAILED ✗"))
+        if self.structural_report:
+            checks_passed = self.structural_report.get("checks_passed", 0)
+            checks_total = self.structural_report.get("checks_total", 0)
+            print(f"  Checks: {checks_passed}/{checks_total}")
+            issues = self.structural_report.get("issues", [])
+            if issues:
+                print(f"  Issues: {len(issues)}")
+
+        print()
+        if self.phase2_skipped:
+            print("Phase 2 (Simulation): SKIPPED ⊘")
+            print(f"  Reason: {self.phase2_skip_reason}")
+        elif self.validator_incompatibility:
+            print("Phase 2 (Simulation): VALIDATOR INCOMPATIBLE ⊘")
+            print(f"  Terminal: {self.validator_incompatibility}")
+            print(f"  Detail: {self.validator_incompatibility_detail}")
+        elif self.infrastructure_failure:
+            print("Phase 2 (Simulation): INFRASTRUCTURE FAILURE ⊘")
+            print(f"  Reason: {self.infrastructure_reason}")
+            if self.simulation_report:
+                precheck_report = self.simulation_report.get("precheck_report")
+                if precheck_report:
+                    print(
+                        f"  Precheck: {precheck_report.get('cycles_simulated', 0)} cycles, "
+                        f"{precheck_report.get('mismatch_count', 0)} mismatches, "
+                        f"{precheck_report.get('protocol_mismatch_count', 0)} protocol mismatches"
+                    )
+        else:
+            print("Phase 2 (Simulation): " + ("PASSED ✓" if self.phase2_passed else "FAILED ✗" if self.phase1_passed else "SKIPPED"))
+            if self.simulation_report:
+                precheck_report = self.simulation_report.get("precheck_report")
+                if precheck_report:
+                    print(
+                        f"  Precheck: {precheck_report.get('cycles_simulated', 0)} cycles, "
+                        f"{precheck_report.get('mismatch_count', 0)} mismatches, "
+                        f"{precheck_report.get('protocol_mismatch_count', 0)} protocol mismatches"
+                    )
+                print(f"  Cycles: {self.simulation_report.get('cycles_simulated', 0)}")
+                print(f"  Mismatches: {self.simulation_report.get('mismatch_count', 0)}")
+                print(f"  Protocol mismatches: {self.simulation_report.get('protocol_mismatch_count', 0)}")
+
+        print()
+        if self.phase2_skipped:
+            overall_passed = bool(self.phase1_passed)
+            overall_result = "PASSED ✓ (structural only)" if overall_passed else "FAILED ✗"
+        elif self.validator_incompatibility:
+            overall_passed = False
+            overall_result = f"VALIDATOR INCOMPATIBLE ⊘ ({self.validator_incompatibility})"
+        elif self.infrastructure_failure:
+            overall_passed = False
+            overall_result = "INFRASTRUCTURE FAILURE ⊘"
+        else:
+            overall_passed = self.phase1_passed and self.phase2_passed
+            overall_result = "PASSED ✓" if overall_passed else "FAILED ✗"
+        print(f"Overall Result: {overall_result}")
+        print("="*70)
+
+        # Save detailed report
+        report_file = self.temp_dir / "validation_report.json"
+        report = {
+            "golden_dcp": str(self.golden_dcp),
+            "revised_dcp": str(self.revised_dcp),
+            "num_vectors": self.num_vectors,
+            "precheck_vectors": self.precheck_vectors,
+            "stimulus_seeds": self.stimulus_seeds,
+            "stimulus_seed_hex": [f"0x{seed:08X}" for seed in self.stimulus_seeds],
+            "stimulus_profile": self.stimulus_profile,
+            "simulation_mode": self.simulation_mode,
+            "clock_period_ns": self.clock_period_ns,
+            "interface_audit": self.interface_audit,
+            "runtime_seconds": elapsed_time,
+            "phase1_passed": self.phase1_passed,
+            "phase2_passed": self.phase2_passed,
+            "phase2_skipped": self.phase2_skipped,
+            "phase2_skip_reason": self.phase2_skip_reason,
+            "infrastructure_failure": self.infrastructure_failure,
+            "infrastructure_reason": self.infrastructure_reason,
+            "validator_incompatibility": self.validator_incompatibility,
+            "validator_incompatibility_detail": self.validator_incompatibility_detail,
+            "overall_passed": overall_passed,
+            "preflight_report": self.preflight_report,
+            "structural_report": self.structural_report,
+            "simulation_report": self.simulation_report,
+            "seed_workspace_prepared": self.seed_workspace_prepared,
+        }
+
+        with open(report_file, 'w') as f:
+            json.dump(report, f, indent=2)
+
+        print(f"\nDetailed report saved: {report_file}")
+        print(f"Working directory preserved: {self.temp_dir}")
+
+    async def cleanup(self):
+        """Clean up resources."""
+        await self.exit_stack.aclose()
+
+
+async def main():
+    parser = argparse.ArgumentParser(
+        description="Validate functional equivalence between two FPGA design checkpoints",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python validate_dcps.py golden.dcp optimized.dcp
+  python validate_dcps.py golden.dcp optimized.dcp --vectors 50000
+  python validate_dcps.py golden.dcp optimized.dcp --vectors 1000 --precheck-vectors 100
+  python validate_dcps.py golden.dcp optimized.dcp --debug
+        """
+    )
+    parser.add_argument("golden_dcp", type=Path, help="Golden (reference) DCP file")
+    parser.add_argument("revised_dcp", type=Path, help="Revised (optimized) DCP file to validate")
+    parser.add_argument("--workspace-dir", type=Path,
+        help="Explicit parent for new temporary validation files (default retains the historical source directory)")
+    parser.add_argument(
+        "--vectors",
+        "-n",
+        type=int,
+        default=200,
+        help="Number of random test vectors to simulate (default: 200). "
+             "Larger benchmarks (e.g. corescore_500_mod) cost ~1s of xsim CPU "
+             "per vector, so the default keeps wall-clock reasonable. Bump this "
+             "up for higher-confidence runs."
+    )
+    parser.add_argument(
+        "--seed",
+        action="append",
+        type=parse_stimulus_seed,
+        dest="stimulus_seeds",
+        help="32-bit stimulus seed (decimal or 0x-prefixed); repeat for a multi-seed run. "
+             "Default: 0xDEADBEEF.",
+    )
+    parser.add_argument(
+        "--simulation-mode",
+        choices=("functional", "timing"),
+        default="functional",
+        help="Functional zero-delay or post-implementation timing simulation.",
+    )
+    parser.add_argument(
+        "--stimulus-profile",
+        choices=("random", "directed"),
+        default="random",
+        help="Input stimulus profile (default: random).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging"
+    )
+    parser.add_argument(
+        "--precheck-vectors",
+        type=int,
+        default=100,
+        help="Run this many vectors before the full simulation and skip the full "
+             "run if the precheck fails (default: 100, disabled if 0 or >= --vectors)."
+    )
+    parser.add_argument(
+        "--no-reactive",
+        action="store_true",
+        help="Disable reactive stimulus generation (use pure LFSR randomness)"
+    )
+    parser.add_argument(
+        "--prepare-seed-workspace-only",
+        action="store_true",
+        help="Export, compile, elaborate and run the common precheck, then stop before full seeds.",
+    )
+
+    args = parser.parse_args()
+
+    # Validate inputs
+    if not args.golden_dcp.exists():
+        print(f"Error: Golden DCP not found: {args.golden_dcp}", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.revised_dcp.exists():
+        print(f"Error: Revised DCP not found: {args.revised_dcp}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.vectors <= 0:
+        print("Error: --vectors must be positive", file=sys.stderr)
+        sys.exit(1)
+
+    if args.precheck_vectors < 0:
+        print("Error: --precheck-vectors must be non-negative", file=sys.stderr)
+        sys.exit(1)
+
+    # Run validation
+    validator = DCPValidator(
+        golden_dcp=args.golden_dcp,
+        revised_dcp=args.revised_dcp,
+        num_vectors=args.vectors,
+        precheck_vectors=args.precheck_vectors,
+        debug=args.debug,
+        no_reactive=args.no_reactive,
+        stimulus_seeds=args.stimulus_seeds,
+        stimulus_profile=args.stimulus_profile,
+        simulation_mode=args.simulation_mode,
+        prepare_seed_workspace_only=args.prepare_seed_workspace_only,
+        workspace_dir=args.workspace_dir,
+    )
+
+    try:
+        await validator.start_servers()
+        success = await validator.validate()
+
+        if validator.infrastructure_failure:
+            sys.exit(2)
+        sys.exit(0 if success or validator.seed_workspace_prepared else 1)
+
+    except KeyboardInterrupt:
+        print("\n\nValidation interrupted by user")
+        sys.exit(130)
+    except Exception as e:
+        logger.exception(f"Fatal error: {e}")
+        sys.exit(1)
+    finally:
+        await validator.cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

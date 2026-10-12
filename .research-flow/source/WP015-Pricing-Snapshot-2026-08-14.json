@@ -1,0 +1,117 @@
+{
+  "captured_at": "2026-08-14",
+  "currency": "USD",
+  "ledger_fields": [
+    "provider_native_usage",
+    "provider_reported_cost_usd",
+    "derived_cost_usd",
+    "pricing_snapshot_id",
+    "effective_price_window",
+    "billing_reconciliation_status"
+  ],
+  "normalised_cost_policy": "also calculate all requests under this frozen snapshot for cross-time comparison",
+  "providers": {
+    "anthropic": {
+      "effective_from": "2026-08-10_standardised",
+      "per_million_tokens": {
+        "claude-sonnet-5": {
+          "cache_read": 0.2,
+          "cache_write_1h": 4.0,
+          "cache_write_5m": 2.5,
+          "input": 2.0,
+          "output_including_thinking": 10.0
+        }
+      }
+    },
+    "deepseek": {
+      "from_2026_08_16_16Z": {
+        "deepseek-v4-flash": {
+          "off_peak": {
+            "cache_hit": 0.007,
+            "cache_miss": 0.22,
+            "output": 0.66
+          },
+          "peak": {
+            "cache_hit": 0.014,
+            "cache_miss": 0.44,
+            "output": 1.32
+          }
+        },
+        "deepseek-v4-pro": {
+          "off_peak": {
+            "cache_hit": 0.022,
+            "cache_miss": 0.66,
+            "output": 1.98
+          },
+          "peak": {
+            "cache_hit": 0.044,
+            "cache_miss": 1.32,
+            "output": 3.96
+          }
+        },
+        "peak_windows_utc": [
+          "01:00-04:00",
+          "06:00-10:00"
+        ]
+      },
+      "per_million_tokens": {
+        "deepseek-v4-flash": {
+          "cache_hit": 0.0028,
+          "cache_miss": 0.14,
+          "output": 0.28
+        },
+        "deepseek-v4-pro": {
+          "cache_hit": 0.003625,
+          "cache_miss": 0.435,
+          "output": 0.87
+        }
+      },
+      "until": "2026-08-16T16:00:00Z"
+    },
+    "google_gemini": {
+      "effective_through": "2026-12-31",
+      "per_million_tokens": {
+        "gemini-3.6-flash": {
+          "input": 0.75,
+          "output_including_thought_tokens": 3.75
+        }
+      }
+    },
+    "openai": {
+      "effective_from": "2026-08-14",
+      "long_context_multipliers": {
+        "input": 2.0,
+        "output": 1.5
+      },
+      "long_context_threshold_tokens": 272000,
+      "per_million_tokens": {
+        "gpt-5.6-luna": {
+          "cache_write_multiplier": 1.25,
+          "cached_input": 0.02,
+          "input": 0.2,
+          "output": 1.2
+        },
+        "gpt-5.6-sol": {
+          "cache_write_multiplier": 1.25,
+          "cached_input": 0.5,
+          "input": 5.0,
+          "output": 30.0
+        },
+        "gpt-5.6-terra": {
+          "cache_write_multiplier": 1.25,
+          "cached_input": 0.2,
+          "input": 2.0,
+          "output": 12.0
+        }
+      }
+    }
+  },
+  "schema_version": "dof.wp015-pricing-snapshot.v1",
+  "snapshot_id": "WP015_PRICING_2026-08-14",
+  "sources": {
+    "anthropic": "https://docs.anthropic.com/en/docs/about-claude/pricing",
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing",
+    "gemini": "https://ai.google.dev/gemini-api/docs/pricing",
+    "openai": "https://developers.openai.com/api/docs/models/"
+  }
+}

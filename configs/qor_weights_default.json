@@ -1,0 +1,8 @@
+{
+  "q_weight_fmax_improvement_ratio": 100.0,
+  "q_weight_wns_improvement_ns": 20.0,
+  "q_weight_tns_improvement_ratio": 5.0,
+  "q_weight_runtime_minutes": 0.0,
+  "q_weight_invalid_output": -100.0,
+  "q_weight_severe_regression": -50.0
+}

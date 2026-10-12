@@ -1,0 +1,10 @@
+{
+  "provider": "openai",
+  "adapter_type": "openai",
+  "base_url": "https://api.openai.com/v1",
+  "api_key_env": "OPENAI_API_KEY",
+  "request_capability_profile_by_model": {
+    "gpt-5.4-mini": "configs/providers/openai_gpt-5.4-mini_chat_completions.json"
+  },
+  "pricing_profile": null
+}
