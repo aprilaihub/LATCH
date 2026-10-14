@@ -141,10 +141,19 @@ results require the corresponding revised data.
 
 ## Paper and acknowledgements
 
-**LATCH: LLM-Assisted Timing Closure Harness for Post-Route FPGA Optimisation.**
-The figures above correspond to the manuscript revision shared on 9 October
-2026. A public paper link and final citation will be added when available;
-no publication or acceptance status is asserted here.
+If you use LATCH in your research, please cite:
+
+```bibtex
+@misc{gu2026latchllmassistedtimingclosure,
+      title={LATCH: LLM-Assisted Timing Closure Harness for Post-Route FPGA Optimisation}, 
+      author={Shu Gu and Matthew Youngman and Yuqin Zhao and Cristian Sestito and Ali Siddique and Ramesh Krishnamurthy and Danial Chitnis and Themis Prodromakis},
+      year={2026},
+      eprint={2610.16625},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2610.16625}, 
+}
+```
 
 LATCH builds on AMD's FPL26 contest software and uses Vivado and RapidWright.
 See [source credits](SOURCE_CREDITS.md) for component-level origins,
